@@ -1,5 +1,7 @@
 # Delimited File Split Utility
 
+[![Test delimited file splitter](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml/badge.svg)](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml)
+
 `split_delimited_file.py` divides one delimited file into an exact number of
 smaller files.
 It is intended to prepare evenly sized source files for Azure Data Factory load
@@ -68,3 +70,17 @@ customers_part_03_of_03.csv
 
 The script prints planned and written record counts, then verifies that every
 source record was written exactly once. An empty source file is rejected.
+
+## Verification
+
+The [GitHub Actions test workflow](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml)
+runs on every push and pull request. It tests comma-delimited CSV and
+pipe-delimited text input, confirms that the extension and header are
+preserved, validates the 2/1/1/1 distribution of five records across four
+files, and verifies quoted fields containing embedded newlines.
+
+To run the same checks locally:
+
+```powershell
+python -m unittest tests/test_split_delimited_file.py -v
+```
