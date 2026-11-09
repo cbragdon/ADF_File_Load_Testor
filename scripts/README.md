@@ -50,6 +50,11 @@ into three files. The source file is shown before splitting:
 python .\scripts\split_delimited_file.py .\data\load_test_input.psv --parts 3 --output-dir .\data\split_output --delimiter "|"
 ```
 
+The splitter reports the record count, planned distribution, each generated
+file, and final validation while it runs:
+
+![Splitting progress and validation output](../docs/images/splitting-progress.svg)
+
 The generated files preserve the `.psv` extension and contain 2, 2, and 1 data
 records respectively:
 
