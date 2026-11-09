@@ -1,11 +1,10 @@
 # SQL Managed Instance ADF Load Monitoring Scripts
 
-This folder contains seven focused read-only T-SQL scripts and one optional
-instance-wide diagnostic for observing Azure SQL Managed Instance (SQL MI)
-while Azure Data Factory (ADF) loads data into a database. The goal is to
-identify whether an ADF tuning change improves throughput or simply moves the
-bottleneck to SQL MI transaction logging, storage I/O, locking, or another
-resource.
+This folder contains eight read-only T-SQL scripts for observing Azure SQL
+Managed Instance (SQL MI) while Azure Data Factory (ADF) loads data into a
+database. The goal is to identify whether an ADF tuning change improves
+throughput or simply moves the bottleneck to SQL MI transaction logging,
+storage I/O, locking, or another resource.
 
 These scripts are intended for the ADF File Load Testor learning lab and for carefully controlled production diagnostics. They do not change database configuration, terminate sessions, shrink files, or clear wait statistics.
 
@@ -21,7 +20,7 @@ For each ADF benchmark:
 4. Run `04_check_log_file_configuration.sql` before the benchmark series and again if file configuration changes.
 5. Run Step 1 of `07_capture_load_wait_stats.sql` immediately before starting ADF. Keep that SQL session open.
 6. Start the ADF Copy Activity.
-7. During a longer load, periodically run `02_monitor_log_space.sql`; use `05_find_active_log_transactions.sql` if log usage or `ACTIVE_TRANSACTION` becomes important.
+7. During a longer load, periodically run `02_monitor_log_space.sql` and `08_monitor_live_file_iops.sql`; use `05_find_active_log_transactions.sql` if log usage or `ACTIVE_TRANSACTION` becomes important.
 8. Capture `06_monitor_file_io_latency.sql` immediately before and after the run so deltas can be calculated.
 9. After the ADF activity finishes, run Step 2 of `07_capture_load_wait_stats.sql` in the same SQL session.
 10. Capture `02_monitor_log_space.sql` and `03_monitor_log_stats.sql` again.
@@ -321,40 +320,41 @@ Two concurrent writers may be more efficient than four for that target-table con
 
 ---
 
-## azure_sql_mi_file_diagnostic_v2-2.sql
+## 08_monitor_live_file_iops.sql
 
 ### Purpose
 
-Collects an instance-wide, five-second I/O snapshot together with file-space
-details and estimated storage guidance for Azure SQL Managed Instance. It is
-intended as an optional diagnostic when the seven focused scripts indicate a
-storage or file-sizing concern that needs broader context.
-
-### Important limitations
-
-- The script uses the undocumented `sp_MSforeachdb` procedure to query each
-  database. Validate its behavior and the required permissions in the target
-  SQL MI environment before relying on its output.
-- Its IOPS and log-rate values are estimates embedded in the script, not live
-  service-limit metadata. Confirm them against the current Azure SQL Managed
-  Instance documentation and the deployed service tier before making a sizing
-  decision.
-- It creates and drops temporary tables and waits five seconds for the I/O
-  sample. It does not persist data or alter database files. The generated
-  `ALTER DATABASE` statements are returned as comments and are not executed.
+Captures a configurable short I/O sample for the current database while an ADF
+load is active. It reports observed reads, writes, IOPS, throughput, latency,
+and data/log file space without inferring service limits from file size.
 
 ### How to use it
 
-Run it from a session with sufficient instance-level DMV visibility. Review the
-file-profile result set for space, I/O, and latency signals, then review the
-instance result set for aggregate IOPS and volume capacity. Treat its
-recommendations as diagnostic input; confirm any resize or service-tier change
-through the current Azure documentation and the test environment's operational
-approval process.
+Run it in the target database while ADF is transferring data. The default
+sample window is five seconds; change `@SampleSeconds` only when a longer
+window better represents the workload. Repeat the sample during a long load
+because a single interval can miss short bursts.
+
+The optional ceiling variables are `NULL` by default. Populate them only with
+current documented limits for the exact SQL MI configuration under test. The
+script calculates percentages only when those values are supplied.
+
+### Key output
+
+- Per-file read/write operations, MiB/s, and average latency for the sample.
+- Per-file allocated, used, and free space for data files.
+- Database-level observed IOPS, read throughput, write throughput, and log
+  write throughput.
+- Optional percentages of the user-supplied documented IOPS and log-write
+  ceilings.
+
+The script creates temporary tables and waits for the configured sample
+duration. It does not persist data, alter database files, or generate resize
+commands.
 
 ---
 
-# Interpreting the seven focused scripts together
+# Interpreting all eight scripts together
 
 No single query identifies an ADF bottleneck. Use the scripts as a diagnostic chain:
 
@@ -381,6 +381,9 @@ ADF Copy Activity is slow
         |
         v
 07 - Where did SQL MI spend its waiting time during the load?
+        |
+        v
+08 - What live file IOPS, throughput, and latency are observed during the active copy?
 ```
 
 Combine those observations with these ADF Copy Activity metrics:
