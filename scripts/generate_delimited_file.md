@@ -13,14 +13,25 @@ Instance, provide both `--connection-string` and `--header-query`.
 ## Requirements
 
 - Python 3.9 or later
-- `pyodbc` only when using database-derived headers
-- A compatible SQL Server ODBC driver only when using database-derived headers
+- No additional Python package when using the default generated headers
 
-Install the Python dependency:
+### When database headers are needed
+
+Install `pyodbc` only when you use both `--connection-string` and
+`--header-query` to read column names from SQL Server or Azure SQL Managed
+Instance. The package lets the generator connect to the database; it is not
+needed for files that use the default `record_id`, `payload`, and
+`created_at_utc` headers.
+
+The dependency list is in the repository-root
+[`requirements.txt`](../requirements.txt) file. From the repository root, run:
 
 ```powershell
 python -m pip install -r .\requirements.txt
 ```
+
+You also need a compatible SQL Server ODBC driver on the computer running the
+script when retrieving database headers.
 
 ## Usage
 
