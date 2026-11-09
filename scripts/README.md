@@ -8,14 +8,14 @@ It is intended to prepare evenly sized source files for Azure Data Factory load
 tests without loading the complete source file into memory.
 
 The script makes two streaming passes over the source: one to count logical
-data records and another to write them. Every output file includes the source
-header. Python's CSV parser preserves records whose quoted fields contain
-embedded line breaks.
+data records and another to write them. By default, every output file includes
+the source header. Use `--no-header` when every record is data. Python's CSV
+parser preserves records whose quoted fields contain embedded line breaks.
 
 ## Requirements
 
 - Python 3.9 or later
-- A delimited text file with a header row
+- A delimited text file, with or without a header row
 
 No third-party packages are required.
 
@@ -36,6 +36,8 @@ python .\scripts\split_delimited_file.py <source-file> [options]
 | `--encoding` | `utf-8-sig` | Source and output encoding. The default supports UTF-8 files with or without a BOM. |
 | `--delimiter` | `,` | Single-character field delimiter. |
 | `--quotechar` | `"` | Single-character quote character. |
+| `--has-header` | Enabled | Treat the first record as a header and write it to every output file. |
+| `--no-header` | Disabled | Treat every record as data; output files contain no header row. |
 
 ## Examples
 
@@ -73,6 +75,12 @@ Split a pipe-delimited CSV that uses Windows-1252 encoding:
 python .\scripts\split_delimited_file.py .\data\events.psv --parts 3 --output-dir .\data\events-split --delimiter "|" --encoding "cp1252"
 ```
 
+Split a headerless pipe-delimited source. Its first record is treated as data:
+
+```powershell
+python .\scripts\split_delimited_file.py .\data\events.psv --parts 3 --output-dir .\data\events-split --delimiter "|" --no-header
+```
+
 The output files preserve the source file extension. For example, splitting 10
 data records from `customers.csv` into 3 parts creates files containing
 4, 3, and 3 data records respectively, plus the header in each file. Output
@@ -91,9 +99,9 @@ source record was written exactly once. An empty source file is rejected.
 
 The [GitHub Actions test workflow](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml)
 runs on every push and pull request. It tests comma-delimited CSV and
-pipe-delimited text input, confirms that the extension and header are
-preserved, validates the 2/1/1/1 distribution of five records across four
-files, and verifies quoted fields containing embedded newlines.
+pipe-delimited text input, confirms that headers are preserved when present,
+validates headerless input, validates the 2/1/1/1 distribution of five records
+across four files, and verifies quoted fields containing embedded newlines.
 
 To run the same checks locally:
 

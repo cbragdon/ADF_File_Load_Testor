@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'split_delimited_file.py'
@@ -56,6 +57,49 @@ class SplitDelimitedFileTests(unittest.TestCase):
 
     def test_txt_extension_preserved(self):
         self._run_case('.txt', '|')
+
+    def test_no_header_flag_preserves_all_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / 'sample.psv'
+            output = root / 'out'
+            rows = [
+                ['1', 'alpha'],
+                ['2', 'bravo'],
+                ['3', 'charlie'],
+                ['4', 'delta'],
+                ['5', 'echo'],
+            ]
+            with source.open('w', encoding='utf-8-sig', newline='') as f:
+                csv.writer(f, delimiter='|', lineterminator='\n').writerows(rows)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    '--parts',
+                    '4',
+                    '--output-dir',
+                    str(output),
+                    '--delimiter',
+                    '|',
+                    '--no-header',
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            combined = []
+            counts = []
+            for path in sorted(output.iterdir()):
+                with path.open('r', encoding='utf-8-sig', newline='') as f:
+                    data = list(csv.reader(f, delimiter='|'))
+                    counts.append(len(data))
+                    combined.extend(data)
+            self.assertEqual(counts, [2, 1, 1, 1])
+            self.assertEqual(combined, rows)
 
 if __name__ == '__main__':
     unittest.main()
