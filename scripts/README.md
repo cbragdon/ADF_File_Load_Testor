@@ -1,4 +1,4 @@
-# CSV Split Utility
+# Delimited File Split Utility
 
 `split_delimited_file.py` divides one delimited file into an exact number of
 smaller files.
@@ -13,7 +13,7 @@ embedded line breaks.
 ## Requirements
 
 - Python 3.9 or later
-- A CSV file with a header row
+- A delimited text file with a header row
 
 No third-party packages are required.
 
@@ -55,7 +55,8 @@ Split a pipe-delimited CSV that uses Windows-1252 encoding:
 python .\scripts\split_delimited_file.py .\data\events.psv --parts 3 --output-dir .\data\events-split --delimiter "|" --encoding "cp1252"
 ```
 
-For example, splitting 10 data records into 3 parts creates files containing
+The output files preserve the source file extension. For example, splitting 10
+data records from `customers.csv` into 3 parts creates files containing
 4, 3, and 3 data records respectively, plus the header in each file. Output
 names follow this pattern:
 

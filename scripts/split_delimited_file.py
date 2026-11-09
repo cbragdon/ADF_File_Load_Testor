@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Split a CSV into exactly N files with near-equal logical record counts.
+"""Split a delimited text file into exactly N files with near-equal logical record counts.
 
-Designed for large CSVs: two streaming passes, no whole-file load into memory.
+Designed for large delimited text files: two streaming passes, no whole-file load into memory.
 Quoted fields containing embedded newlines are handled by Python's csv module.
 """
 
@@ -25,7 +25,7 @@ def distribution(total: int, parts: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(parts)]
 
 
-def split_csv(source: Path, output_dir: Path, parts: int, encoding: str, delimiter: str, quotechar: str) -> None:
+def split_delimited_file(source: Path, output_dir: Path, parts: int, encoding: str, delimiter: str, quotechar: str) -> None:
     if parts < 1:
         raise ValueError("--parts must be at least 1")
     if not source.is_file():
@@ -48,10 +48,10 @@ def split_csv(source: Path, output_dir: Path, parts: int, encoding: str, delimit
         try:
             header = next(reader)
         except StopIteration as exc:
-            raise ValueError("Source CSV is empty") from exc
+            raise ValueError("Source delimited file is empty") from exc
 
         for idx, planned in enumerate(counts, start=1):
-            target = output_dir / f"{stem}_part_{idx:0{width}d}_of_{parts:0{width}d}.csv"
+            target = output_dir / f"{stem}_part_{idx:0{width}d}_of_{parts:0{width}d}{source.suffix}"
             current = 0
             with target.open("w", encoding=encoding, newline="") as dst:
                 writer = csv.writer(dst, delimiter=delimiter, quotechar=quotechar,
@@ -80,15 +80,15 @@ def split_csv(source: Path, output_dir: Path, parts: int, encoding: str, delimit
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Split a large CSV into exactly N near-equal files.")
-    parser.add_argument("source", type=Path, help="Source CSV path")
+    parser = argparse.ArgumentParser(description="Split a large delimited text file into exactly N near-equal files.")
+    parser.add_argument("source", type=Path, help="Source delimited text file path")
     parser.add_argument("--output-dir", type=Path, default=Path("split_output"))
     parser.add_argument("--parts", type=int, default=4)
     parser.add_argument("--encoding", default="utf-8-sig", help="Default handles UTF-8 with or without BOM")
     parser.add_argument("--delimiter", default=",")
     parser.add_argument("--quotechar", default='"')
     args = parser.parse_args()
-    split_csv(args.source, args.output_dir, args.parts, args.encoding, args.delimiter, args.quotechar)
+    split_delimited_file(args.source, args.output_dir, args.parts, args.encoding, args.delimiter, args.quotechar)
 
 if __name__ == "__main__":
     main()
