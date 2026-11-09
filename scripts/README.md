@@ -39,26 +39,21 @@ python .\scripts\split_delimited_file.py <source-file> [options]
 
 ## Examples
 
-### Before and after a split
+### Animated split summary
 
-The following documented sample run splits a five-record pipe-delimited file
-into three files. The source file is shown before splitting:
+This animation illustrates a 2 GB delimited source file containing 24,000,000
+rows. It shows the splitter planning and validating an even four-way split:
+four 500 MB files containing 6,000,000 rows each.
 
-![Before splitting a five-record pipe-delimited source file](../docs/images/before-splitting.svg)
+![Animation of a 2 GB file splitting into four files](../docs/images/split-summary.gif)
 
 ```powershell
-python .\scripts\split_delimited_file.py .\data\load_test_input.psv --parts 3 --output-dir .\data\split_output --delimiter "|"
+python .\scripts\split_delimited_file.py .\data\load_test_input.psv --parts 4 --output-dir .\data\split_output --delimiter "|"
 ```
 
-The splitter reports the record count, planned distribution, each generated
-file, and final validation while it runs:
-
-![Splitting progress and validation output](../docs/images/splitting-progress.svg)
-
-The generated files preserve the `.psv` extension and contain 2, 2, and 1 data
-records respectively:
-
-![After splitting into three pipe-delimited files](../docs/images/after-splitting.svg)
+The actual file size and row count depend on the input. The animation uses the
+24,000,000-row example above to show how the reported planned and validated
+counts relate to four output files.
 
 Split a source into four files in the default `split_output` directory:
 
