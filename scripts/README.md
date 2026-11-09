@@ -1,6 +1,7 @@
 # CSV Split Utility
 
-`split_csv.py` divides one CSV file into an exact number of smaller CSV files.
+`split_delimited_file.py` divides one delimited file into an exact number of
+smaller files.
 It is intended to prepare evenly sized source files for Azure Data Factory load
 tests without loading the complete source file into memory.
 
@@ -21,7 +22,7 @@ No third-party packages are required.
 Run the script from the repository root:
 
 ```powershell
-python .\scripts\split_csv.py <source-csv> [options]
+python .\scripts\split_delimited_file.py <source-file> [options]
 ```
 
 ### Options
@@ -39,19 +40,19 @@ python .\scripts\split_csv.py <source-csv> [options]
 Split a source into four files in the default `split_output` directory:
 
 ```powershell
-python .\scripts\split_csv.py .\data\customers.csv
+python .\scripts\split_delimited_file.py .\data\customers.csv
 ```
 
 Create eight files in an explicit location for a load test:
 
 ```powershell
-python .\scripts\split_csv.py .\data\sales.csv --parts 8 --output-dir .\data\load-test-input
+python .\scripts\split_delimited_file.py .\data\sales.csv --parts 8 --output-dir .\data\load-test-input
 ```
 
 Split a pipe-delimited CSV that uses Windows-1252 encoding:
 
 ```powershell
-python .\scripts\split_csv.py .\data\events.psv --parts 3 --output-dir .\data\events-split --delimiter "|" --encoding "cp1252"
+python .\scripts\split_delimited_file.py .\data\events.psv --parts 3 --output-dir .\data\events-split --delimiter "|" --encoding "cp1252"
 ```
 
 For example, splitting 10 data records into 3 parts creates files containing
