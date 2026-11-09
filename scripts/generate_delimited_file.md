@@ -1,5 +1,7 @@
 # Delimited File Generator
 
+[![Test delimited file generator](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml/badge.svg)](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml)
+
 `generate_delimited_file.py` creates delimited files for Azure Data Factory
 load testing. It streams records directly to the output file, so memory use
 does not grow with the requested row count.
