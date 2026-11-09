@@ -73,3 +73,20 @@ column names such as `record_id`, `payload`, and `created_at_utc` receive their
 corresponding default values. Other database-derived column names receive a
 unique `<column-name>_<record-number>` value. This provides valid delimited
 load-test data while preserving the database column names.
+
+## Verification
+
+This script is verified by `tests\test_generate_delimited_file.py` and the
+repository's [GitHub Actions workflow](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml).
+The automated checks validate:
+
+- Generation of the requested number of rows with the default headers.
+- Command-line encoding, delimiter, and quote-character options.
+- Database-derived header retrieval through a mocked `pyodbc` connection.
+- Integrated authentication acceptance and rejection of stored SQL credentials.
+
+Run the same verification from the repository root:
+
+```powershell
+python -m unittest tests/test_generate_delimited_file.py -v
+```
