@@ -1,6 +1,6 @@
 # Delimited File Split Utility
 
-[![Test delimited file splitter](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml/badge.svg)](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml)
+[![Test delimited file splitter](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml/badge.svg)](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml)
 
 `split_delimited_file.py` divides one delimited file into an exact number of
 smaller files.
@@ -117,7 +117,7 @@ source record was written exactly once. An empty source file is rejected.
 
 ## Verification
 
-The [GitHub Actions test workflow](https://github.com/cbragdon/ADF_File_Load_Testor/actions/workflows/test.yml)
+The [GitHub Actions test workflow](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml)
 runs on every push and pull request. It tests comma-delimited CSV and
 pipe-delimited text input, confirms that headers are preserved when present,
 validates headerless input, validates the 2/1/1/1 distribution of five records

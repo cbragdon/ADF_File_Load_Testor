@@ -6,7 +6,7 @@ database. The goal is to identify whether an ADF tuning change improves
 throughput or simply moves the bottleneck to SQL MI transaction logging,
 storage I/O, locking, or another resource.
 
-These scripts are intended for the ADF File Load Testor learning lab and for carefully controlled production diagnostics. They do not change database configuration, terminate sessions, shrink files, or clear wait statistics.
+These scripts are intended for the ADF Performance Toolkit learning lab and for carefully controlled production diagnostics. They do not change database configuration, terminate sessions, shrink files, or clear wait statistics.
 
 > **Important:** SQL MI user databases use the FULL recovery model. Treat transaction-log behavior as part of the workload to measure and tune. Do not base the test plan on switching to SIMPLE or BULK_LOGGED recovery.
 
