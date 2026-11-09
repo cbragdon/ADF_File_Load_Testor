@@ -39,6 +39,22 @@ python .\scripts\split_delimited_file.py <source-file> [options]
 
 ## Examples
 
+### Before and after a split
+
+The following documented sample run splits a five-record pipe-delimited file
+into three files. The source file is shown before splitting:
+
+![Before splitting a five-record pipe-delimited source file](../docs/images/before-splitting.svg)
+
+```powershell
+python .\scripts\split_delimited_file.py .\data\load_test_input.psv --parts 3 --output-dir .\data\split_output --delimiter "|"
+```
+
+The generated files preserve the `.psv` extension and contain 2, 2, and 1 data
+records respectively:
+
+![After splitting into three pipe-delimited files](../docs/images/after-splitting.svg)
+
 Split a source into four files in the default `split_output` directory:
 
 ```powershell
