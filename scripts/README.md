@@ -27,6 +27,26 @@ Run the script from the repository root:
 python .\scripts\split_delimited_file.py <source-file> [options]
 ```
 
+### Usage examples
+
+Split a headered CSV into the default four output files:
+
+```powershell
+python .\scripts\split_delimited_file.py .\data\customers.csv
+```
+
+Split a headerless pipe-delimited file into four output files:
+
+```powershell
+python .\scripts\split_delimited_file.py .\data\events.psv --delimiter "|" --no-header
+```
+
+Create eight pipe-delimited files in a load-test input directory:
+
+```powershell
+python .\scripts\split_delimited_file.py .\data\sales.psv --parts 8 --output-dir .\data\load-test-input --delimiter "|"
+```
+
 ### Options
 
 | Option | Default | Description |
