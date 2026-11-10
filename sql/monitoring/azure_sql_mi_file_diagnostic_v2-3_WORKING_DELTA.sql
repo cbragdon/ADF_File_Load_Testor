@@ -2,9 +2,9 @@
 ================================================================================
 Azure SQL MI File Diagnostic v2.3 - WORKING MERGE DELTA
 ================================================================================
-This is the first coding artifact after merge review. It is NOT a standalone
-replacement for v2-2 yet. Apply these extensions to a copy of v2-2 so the
-original file remains unchanged during comparison testing.
+This is the first coding artifact after merge review. It is a standalone
+measurement delta for comparison testing, not a complete replacement for the
+v2-2 result sets yet.
 
 Non-negotiable:
     Preserve: WAITFOR DELAY '00:00:05';
@@ -26,6 +26,82 @@ GO
 SET NUMERIC_ROUNDABORT OFF;
 GO
 SET NOCOUNT ON;
+
+/* -----------------------------------------------------------------------------
+BOOTSTRAP: collect the file metadata required by the v2.3 activity result set.
+
+The original delta assumed a prior v2-2 execution in the same query session.
+Local temporary tables do not survive a different session, so collect visible
+online database metadata here. This preserves instance-wide I/O measurement
+without requiring v2-2 to run first.
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS #MI_File_Stats;
+DROP TABLE IF EXISTS #File_IO_Snapshot_1;
+DROP TABLE IF EXISTS #File_IO_Snapshot_2;
+DROP TABLE IF EXISTS #FileDeltas;
+
+CREATE TABLE #MI_File_Stats
+(
+    DatabaseID int NOT NULL,
+    FileID int NOT NULL,
+    DatabaseName sysname NOT NULL,
+    LogicalName sysname NOT NULL,
+    FileType varchar(10) NOT NULL,
+    FileSizeGB decimal(12, 2) NOT NULL,
+    SpaceUsedGB decimal(12, 2) NULL,
+    FreeSpaceInFileGB decimal(12, 2) NULL,
+    PRIMARY KEY (DatabaseID, FileID)
+);
+
+DECLARE @DatabaseName sysname;
+DECLARE @Sql nvarchar(max);
+
+DECLARE DatabaseCursor CURSOR LOCAL FAST_FORWARD FOR
+SELECT name
+FROM sys.databases
+WHERE state_desc = N'ONLINE';
+
+OPEN DatabaseCursor;
+FETCH NEXT FROM DatabaseCursor INTO @DatabaseName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @Sql = N'
+USE ' + QUOTENAME(@DatabaseName) + N';
+INSERT INTO #MI_File_Stats
+(
+    DatabaseID,
+    FileID,
+    DatabaseName,
+    LogicalName,
+    FileType,
+    FileSizeGB,
+    SpaceUsedGB,
+    FreeSpaceInFileGB
+)
+SELECT
+    DB_ID(),
+    file_id,
+    DB_NAME(),
+    name,
+    type_desc,
+    CAST(size * 8.0 / 1024.0 / 1024.0 AS decimal(12, 2)),
+    CASE
+        WHEN type_desc = ''ROWS''
+            THEN CAST(FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024.0 / 1024.0 AS decimal(12, 2))
+    END,
+    CASE
+        WHEN type_desc = ''ROWS''
+            THEN CAST((size - FILEPROPERTY(name, ''SpaceUsed'')) * 8.0 / 1024.0 / 1024.0 AS decimal(12, 2))
+    END
+FROM sys.database_files;';
+
+    EXEC sys.sp_executesql @Sql;
+    FETCH NEXT FROM DatabaseCursor INTO @DatabaseName;
+END;
+
+CLOSE DatabaseCursor;
+DEALLOCATE DatabaseCursor;
 
 /* -----------------------------------------------------------------------------
 STEP 3 REPLACEMENT: extend both snapshot tables with bytes and split stalls.
@@ -221,3 +297,8 @@ Merge these columns into v2-2 Result Set 1, then tighten recommendation logic:
 Do not remove original v2-2 fields or action-oriented outputs.
 Do not retire script 08 until the complete v2.3 script passes side-by-side tests.
 */
+
+DROP TABLE #MI_File_Stats;
+DROP TABLE #File_IO_Snapshot_1;
+DROP TABLE #File_IO_Snapshot_2;
+DROP TABLE #FileDeltas;
