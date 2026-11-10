@@ -256,6 +256,7 @@ SELECT
     ISNULL(d.Live_Write_MiBps,0) AS Live_Write_MiBps,
     ISNULL(d.Live_Avg_Read_Latency_MS,0) AS Live_Avg_Read_Latency_MS,
     ISNULL(d.Live_Avg_Write_Latency_MS,0) AS Live_Avg_Write_Latency_MS,
+    ISNULL(d.IO_Stall_Delta_MS,0) AS IO_Stall_Delta_MS,
     ISNULL(d.Live_Avg_Stall_Per_IO_MS,0) AS Live_Avg_Stall_Per_IO_MS,
     CAST(100.0 * ISNULL(d.Live_File_IOPS,0) /
          NULLIF(CASE WHEN f.FileType='ROWS' THEN
@@ -270,21 +271,62 @@ CROSS JOIN #Instance_Config AS ic;
 
 /* RESULT SET 1: DETAILED FILE PROFILE AND GUIDANCE - ENHANCED v2-2 */
 SELECT
-    CASE WHEN DatabaseID=@TargetDatabaseID THEN 'TARGET_DATABASE'
-         WHEN DatabaseName='tempdb' THEN 'TEMPDB'
-         WHEN DatabaseID>4 THEN 'OTHER_USER_DATABASE' ELSE 'SYSTEM_DATABASE' END AS DatabaseCategory,
     DatabaseName, LogicalName, FileType,
     FileSizeGB AS Current_File_Size_GB,
     SpaceUsedGB AS Space_Used_Inside_File_GB,
     FreeSpaceInFileGB AS Free_Space_Inside_File_GB,
     CASE
-        WHEN FileType='LOG' THEN CONCAT(CAST(EstimatedDatabaseLogCapMBps AS varchar(20)), ' MB/s Estimated Cap (v2-2 model)')
-        WHEN EstimatedFileIOPSCeiling IS NOT NULL THEN CONCAT(CAST(EstimatedFileIOPSCeiling AS varchar(20)), ' Estimated IOPS (v2-2 model)')
-        ELSE 'Pooled/Not individually estimated'
+        WHEN ic.ServiceTier LIKE '%Business Critical%' THEN CAST((ic.vCores * 4000) AS varchar(30)) + ' (Pooled BC Total)'
+        WHEN ic.ServiceTier LIKE '%General Purpose%' AND ic.TotalInstanceReservedGB > 16384 THEN CAST(ic.MaxInstanceIOPS AS varchar(30)) + ' (Pooled SAN Total)'
+        WHEN FileType='LOG' THEN
+            CASE WHEN FileSizeGB <= 128 THEN '22 MB/s Cap (Shared Quota)'
+                 WHEN FileSizeGB <= 512 THEN '30 MB/s Cap (Shared Quota)'
+                 WHEN FileSizeGB <= 1024 THEN '50 MB/s Cap (Shared Quota)'
+                 ELSE '65 MB/s Cap (Shared Quota)' END
+        WHEN FileSizeGB <= 32 THEN '120 IOPS'
+        WHEN FileSizeGB <= 64 THEN '240 IOPS'
+        WHEN FileSizeGB <= 128 THEN '500 IOPS'
+        WHEN FileSizeGB <= 512 THEN '1100 IOPS'
+        WHEN FileSizeGB <= 1024 THEN '2300 IOPS'
+        WHEN FileSizeGB <= 2048 THEN '5000 IOPS'
+        ELSE '7500 IOPS'
     END AS Estimated_File_Max_IOPS_Or_Log_Cap,
+    Live_File_IOPS AS Live_Current_File_IOPS,
+    IO_Stall_Delta_MS AS Live_IO_Stall_Window_Delta_MS,
+    Live_Avg_Stall_Per_IO_MS,
+    CASE
+        WHEN FileType='ROWS' AND EstimatedFileIOPSUtilizationPercent>=70
+             AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15)
+             AND ISNULL(@InstanceIOPSUtilization,0)<70 THEN
+            'CRITICAL LATENCY: This file is causing PAGEIOLATCH wait states. ' +
+            CASE WHEN FileSizeGB<=32 THEN 'Action Required: Expand file size to 33 GB to scale up from 120 IOPS to 240 IOPS.'
+                 WHEN FileSizeGB<=64 THEN 'Action Required: Expand file size to 65 GB to scale up from 240 IOPS to 500 IOPS.'
+                 WHEN FileSizeGB<=128 THEN 'Action Required: Expand file size to 129 GB to scale up from 500 IOPS to 1,100 IOPS.'
+                 WHEN FileSizeGB<=512 THEN 'Action Required: Expand file size to 513 GB to scale up from 1,100 IOPS to 2,300 IOPS.'
+                 WHEN FileSizeGB<=1024 THEN 'Action Required: Expand file size to 1,025 GB to scale up from 2,300 IOPS to 5,000 IOPS.'
+                 WHEN FileSizeGB<=2048 THEN 'Action Required: Expand file size to 2,049 GB to scale up from 5,000 IOPS to 7,500 IOPS.'
+                 ELSE 'Max file-level IOPS reached for this tier (7,500 IOPS). If stalls persist, you must scale up instance vCores.' END
+        ELSE 'Healthy Storage Subsystem'
+    END AS Diagnostic_Action_Item,
+    CASE
+        WHEN FileType='ROWS' AND EstimatedFileIOPSUtilizationPercent>=70
+             AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15)
+             AND ISNULL(@InstanceIOPSUtilization,0)<70 THEN
+            '-- ALTER DATABASE ' + QUOTENAME(DatabaseName) + ' MODIFY FILE (NAME = N''' + REPLACE(LogicalName,'''','''''') + ''', SIZE = ' +
+            CASE WHEN FileSizeGB<=32 THEN '33GB' WHEN FileSizeGB<=64 THEN '65GB'
+                 WHEN FileSizeGB<=128 THEN '129GB' WHEN FileSizeGB<=512 THEN '513GB'
+                 WHEN FileSizeGB<=1024 THEN '1025GB' WHEN FileSizeGB<=2048 THEN '2049GB'
+                 ELSE CAST(CAST(FileSizeGB AS int) AS varchar(20))+'GB' END + ');'
+        ELSE '-- File performance is healthy.'
+    END AS Safety_Script_To_Expand_File,
+    CASE
+        WHEN ISNULL(@InstanceIOPSUtilization,0)>=70 OR ISNULL(@InstanceLogUtilization,0)>=70
+          OR (FileType='ROWS' AND FileSizeGB>2048) THEN 'RECOMMEND EVALUATION: ' + @NextGenSpec
+        ELSE 'No immediate need; classic GP remediation (file expansion) remains available.'
+    END AS Next_Gen_GP_Recommendation,
     Sample_Seconds, Read_IOPS, Write_IOPS, Live_File_IOPS,
     Live_Read_MiBps, Live_Write_MiBps,
-    Live_Avg_Read_Latency_MS, Live_Avg_Write_Latency_MS, Live_Avg_Stall_Per_IO_MS,
+    Live_Avg_Read_Latency_MS, Live_Avg_Write_Latency_MS,
     EstimatedFileIOPSUtilizationPercent,
     @InstanceIOPSUtilization AS Estimated_Instance_IOPS_Utilization_Percent,
     CASE
@@ -296,35 +338,14 @@ SELECT
         ELSE 'HEALTHY_OR_NO_ACTIVITY'
     END AS Constraint_Classification,
     CASE
-        WHEN FileType='ROWS' AND EstimatedFileIOPSUtilizationPercent>=70
-             AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15)
-             AND ISNULL(@InstanceIOPSUtilization,0)<70 THEN
-            'Probable file-level constraint: high latency and file IOPS utilization while instance has headroom. Evaluate the next validated file-size bracket.'
-        WHEN ISNULL(@InstanceIOPSUtilization,0)>=70 THEN
-            'Probable instance-level IOPS constraint: expanding one file is unlikely to resolve the primary limit. Evaluate MI capacity/configuration.'
-        WHEN ISNULL(@InstanceLogUtilization,0)>=70 THEN
-            'Probable instance log-throughput constraint: correlate with WRITELOG and INSTANCE_LOG_RATE_GOVERNOR before changing ADF pressure.'
-        WHEN FileType='ROWS' AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15) THEN
-            'Elevated latency, but file/instance ceiling proximity is not proven. Investigate waits and repeat the sample before resizing.'
-        ELSE 'No file or instance capacity constraint proven in this sample.'
-    END AS Diagnostic_Action_Item,
-    CASE
-        WHEN FileType='ROWS' AND EstimatedFileIOPSUtilizationPercent>=70
-             AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15)
-             AND ISNULL(@InstanceIOPSUtilization,0)<70 THEN
-            '-- ALTER DATABASE ' + QUOTENAME(DatabaseName) + ' MODIFY FILE (NAME = N''' + REPLACE(LogicalName,'''','''''') + ''', SIZE = ' +
-            CASE WHEN FileSizeGB<=32 THEN '33GB' WHEN FileSizeGB<=64 THEN '65GB'
-                 WHEN FileSizeGB<=128 THEN '129GB' WHEN FileSizeGB<=512 THEN '513GB'
-                 WHEN FileSizeGB<=1024 THEN '1025GB' WHEN FileSizeGB<=2048 THEN '2049GB'
-                 ELSE CAST(CAST(FileSizeGB AS int) AS varchar(20))+'GB' END + ');'
-        ELSE '-- No evidence-based file expansion recommendation from this sample.'
-    END AS Safety_Script_To_Expand_File,
-    CASE
         WHEN ISNULL(@InstanceIOPSUtilization,0)>=70 OR ISNULL(@InstanceLogUtilization,0)>=70
-          OR (FileType='ROWS' AND FileSizeGB>2048) THEN 'RECOMMEND EVALUATION: ' + @NextGenSpec
-        ELSE 'No immediate Next-gen GP recommendation from this sample.'
-    END AS Next_Gen_GP_Recommendation
+            THEN 'File expansion is unlikely to resolve the primary constraint. Evaluate MI capacity/configuration.'
+        WHEN FileType='ROWS' AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15)
+            THEN 'Elevated latency is present, but file/instance ceiling proximity is not proven. Investigate waits and repeat the sample before resizing.'
+        ELSE 'No additional file or instance capacity constraint is proven in this sample.'
+    END AS Merged_Recommendation
 FROM #FileAnalysis
+CROSS JOIN #Instance_Config AS ic
 ORDER BY CASE WHEN DatabaseID=@TargetDatabaseID THEN 1 WHEN DatabaseName='tempdb' THEN 2 WHEN DatabaseID>4 THEN 3 ELSE 4 END,
          DatabaseName, FileType, LogicalName;
 
@@ -333,9 +354,10 @@ ORDER BY CASE WHEN DatabaseID=@TargetDatabaseID THEN 1 WHEN DatabaseName='tempdb
 (
     SELECT
         DatabaseID, DatabaseName,
-        CASE WHEN DatabaseID=@TargetDatabaseID THEN 'TARGET_DATABASE'
-             WHEN DatabaseName='tempdb' THEN 'TEMPDB'
-             WHEN DatabaseID>4 THEN 'OTHER_USER_DATABASE' ELSE 'SYSTEM_DATABASE' END AS DatabaseCategory,
+        CASE WHEN DatabaseID=@TargetDatabaseID THEN 1
+             WHEN DatabaseName='tempdb' THEN 2
+             WHEN DatabaseID>4 THEN 3 ELSE 4 END AS DisplayOrder,
+        CASE WHEN DatabaseID<=4 THEN 1 ELSE 0 END AS IsSystemDatabase,
         SUM(Read_IOPS) AS Read_IOPS,
         SUM(Write_IOPS) AS Write_IOPS,
         SUM(Live_File_IOPS) AS Total_IOPS,
@@ -346,7 +368,7 @@ ORDER BY CASE WHEN DatabaseID=@TargetDatabaseID THEN 1 WHEN DatabaseName='tempdb
     GROUP BY DatabaseID, DatabaseName
 )
 SELECT
-    DatabaseName, DatabaseCategory,
+    DatabaseName,
     CAST(Read_IOPS AS decimal(19,2)) AS Read_IOPS,
     CAST(Write_IOPS AS decimal(19,2)) AS Write_IOPS,
     CAST(Total_IOPS AS decimal(19,2)) AS Total_IOPS,
@@ -355,28 +377,35 @@ SELECT
     CAST(Log_Write_MiBps AS decimal(19,2)) AS Log_Write_MiBps,
     CAST(100.0*Total_IOPS/NULLIF(@CombinedLiveInstanceIOPS,0) AS decimal(9,2)) AS Percent_Of_Observed_Instance_IOPS
 FROM DatabaseActivity
-WHERE DatabaseCategory<>'SYSTEM_DATABASE' OR Total_IOPS>0
-ORDER BY CASE DatabaseCategory WHEN 'TARGET_DATABASE' THEN 1 WHEN 'TEMPDB' THEN 2 WHEN 'OTHER_USER_DATABASE' THEN 3 ELSE 4 END,
-         Total_IOPS DESC;
+WHERE IsSystemDatabase=0 OR Total_IOPS>0
+ORDER BY DisplayOrder, Total_IOPS DESC;
 
 /* RESULT SET 3: INSTANCE CAPACITY AND OVERLOAD DIAGNOSIS - ENHANCED v2-2 */
 SELECT
     ic.ServiceTier AS Service_Tier,
     ic.vCores AS Allocated_vCores,
-    ic.MaxInstanceIOPS AS Estimated_Max_Instance_Data_IOPS_Ceiling,
-    @CombinedLiveInstanceIOPS AS Live_Total_Instance_IOPS,
-    @InstanceIOPSUtilization AS Estimated_Instance_IOPS_Utilization_Percent,
+    ic.MaxInstanceIOPS AS Max_Instance_Data_IOPS_Ceiling,
+    @CombinedLiveInstanceIOPS AS Live_Total_Instance_Driven_IOPS,
+    CASE
+        WHEN ISNULL(@InstanceIOPSUtilization,0)>=90 THEN 'CRITICAL OVERLOAD: Instance is consuming ' + CAST(CAST(@CombinedLiveInstanceIOPS AS int) AS varchar(10)) + ' IOPS. You are breaching 90% of our global vCore container ceiling (' + CAST(ic.MaxInstanceIOPS AS varchar(10)) + ' IOPS). File expansions will fail to improve performance. Action Required: Upscale compute node vCores.'
+        WHEN ISNULL(@InstanceIOPSUtilization,0)>=70 THEN 'WARNING: High storage volume traffic. Consuming over 70% of instance bandwidth pool. Monitor closely.'
+        ELSE 'Healthy: Combined instance storage workload is well within our VM container processing brackets.'
+    END AS Instance_IOPS_Alert_Status,
     ic.TotalInstanceReservedGB AS Total_Volume_Size_GB,
-    ic.TotalInstanceUsedGB AS Total_Volume_Used_GB,
     ic.TotalInstanceReservedGB-ic.TotalInstanceUsedGB AS Volume_Free_Space_GB,
-    ic.EstimatedInstanceLogWriteCeilingMiBps AS Estimated_Instance_Log_Write_Ceiling_MiBps,
+    CAST(ic.EstimatedInstanceLogWriteCeilingMiBps AS varchar(20)) + ' MiB/s' AS Instance_Log_Write_Ceiling,
+    CASE
+        WHEN ic.ServiceTier NOT LIKE N'%General Purpose%' OR ic.TotalInstanceReservedGB>16384 THEN 'N/A (Not classic General Purpose)'
+        WHEN ic.TotalInstanceReservedGB-ic.TotalInstanceUsedGB < ic.TotalInstanceReservedGB*0.10
+          OR ISNULL(@InstanceIOPSUtilization,0)>=70
+          OR EXISTS (SELECT 1 FROM #FileAnalysis WHERE FileType='ROWS' AND FileSizeGB>2048)
+        THEN 'RECOMMEND EVALUATION: '+@NextGenSpec
+        ELSE 'No immediate need; classic GP remediation (file expansion) remains available.'
+    END AS Next_Gen_GP_Recommendation,
+    @InstanceIOPSUtilization AS Estimated_Instance_IOPS_Utilization_Percent,
+    ic.TotalInstanceUsedGB AS Total_Volume_Used_GB,
     @ObservedInstanceLogWriteMiBps AS Observed_Instance_Log_Write_MiBps,
     @InstanceLogUtilization AS Estimated_Instance_Log_Utilization_Percent,
-    CASE
-        WHEN ISNULL(@InstanceIOPSUtilization,0)>=90 THEN 'CRITICAL: Observed instance IOPS is at or above 90% of the estimated v2-2 ceiling.'
-        WHEN ISNULL(@InstanceIOPSUtilization,0)>=70 THEN 'WARNING: Observed instance IOPS is at or above 70% of the estimated v2-2 ceiling.'
-        ELSE 'Observed instance IOPS is below the v2-2 warning threshold.'
-    END AS Instance_IOPS_Alert_Status,
     CASE
         WHEN ISNULL(@InstanceIOPSUtilization,0)>=70 AND EXISTS
              (SELECT 1 FROM #FileAnalysis WHERE EstimatedFileIOPSUtilizationPercent>=70) THEN 'MIXED'
@@ -395,14 +424,6 @@ SELECT
             'Instance has headroom but one or more files show high latency near their estimated file ceiling. Evaluate file-level remediation.'
         ELSE 'This sample does not prove a file-size or instance-capacity constraint. Correlate with waits and repeat during sustained load.'
     END AS Evidence_Based_Next_Action,
-    CASE
-        WHEN ic.ServiceTier NOT LIKE N'%General Purpose%' OR ic.TotalInstanceReservedGB>16384 THEN 'N/A (Not classic General Purpose based on v2-2 model)'
-        WHEN ic.TotalInstanceReservedGB-ic.TotalInstanceUsedGB < ic.TotalInstanceReservedGB*0.10
-          OR ISNULL(@InstanceIOPSUtilization,0)>=70
-          OR EXISTS (SELECT 1 FROM #FileAnalysis WHERE FileType='ROWS' AND FileSizeGB>2048)
-        THEN 'RECOMMEND EVALUATION: '+@NextGenSpec
-        ELSE 'No immediate need; classic GP remediation may remain available.'
-    END AS Next_Gen_GP_Recommendation
 FROM #Instance_Config AS ic;
 
 DROP TABLE #FileAnalysis;
