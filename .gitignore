@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated test data
+output/
+generated_*
+*.generated.csv
+*.generated.txt
+
+# Documents
+*.docx
+*.pdf
+
+# Local environment / secrets
+.env
+.env.*

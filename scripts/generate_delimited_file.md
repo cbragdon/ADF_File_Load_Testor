@@ -2,104 +2,161 @@
 
 [![Test delimited file generator](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml/badge.svg)](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml)
 
-`generate_delimited_file.py` creates delimited files for Azure Data Factory
-load testing. It streams records directly to the output file, so memory use
-does not grow with the requested row count.
+`generate_delimited_file.py` creates synthetic delimited files for Azure Data
+Factory performance testing. It supports three generation paths:
 
-By default, the generated columns are `record_id`, `payload`, and
-`created_at_utc`. To use column names from SQL Server or Azure SQL Managed
-Instance, provide both `--connection-string` and `--header-query`.
+| Path | When to use it | Data source |
+| --- | --- | --- |
+| Standalone schema | You do not need database metadata. | A JSON configuration file. |
+| Schema-aware database | You need a file that matches a table's shape. | SQL Server metadata only. |
+| SDV synthetic data | You need values statistically modeled from source data. | SQL Server metadata plus a read-only sample. |
+
+The generator never accepts a user name, password, client secret, access token,
+or credential-bearing connection string. Database access always uses the
+identity of the person running the script.
 
 ## Requirements
 
 - Python 3.9 or later
-- No additional Python package when using the default generated headers
+- `pyodbc` and Microsoft ODBC Driver 18 for SQL Server for database generation
+- `sdv`, `pandas`, and their optional dependencies only for SDV generation
 
-### When database headers are needed
-
-Install `pyodbc` only when you use both `--connection-string` and
-`--header-query` to read column names from SQL Server or Azure SQL Managed
-Instance. The package lets the generator connect to the database; it is not
-needed for files that use the default `record_id`, `payload`, and
-`created_at_utc` headers.
-
-The dependency list is in the repository-root
-[`requirements.txt`](../requirements.txt) file. From the repository root, run:
+Install the base dependency for database access:
 
 ```powershell
 python -m pip install -r .\requirements.txt
 ```
 
-You also need a compatible SQL Server ODBC driver on the computer running the
-script when retrieving database headers.
+`requirements.txt` is in the repository root. You can skip this installation
+when using only standalone JSON-schema generation.
 
-## Usage
+## Standalone schema generation
 
-Generate one million comma-delimited records with the default headers:
-
-```powershell
-python .\scripts\generate_delimited_file.py .\data\load_input.csv --rows 1000000
-```
-
-Generate pipe-delimited output with Windows-1252 encoding:
+Use the example schema in `config\generate_delimited_file.example.json` when
+you do not need a database connection:
 
 ```powershell
-python .\scripts\generate_delimited_file.py .\data\load_input.psv --rows 500000 --delimiter "|" --encoding "cp1252"
+python .\scripts\generate_delimited_file.py `
+  --config .\config\generate_delimited_file.example.json `
+  --engine schema `
+  --rows 1000 `
+  --delimiter "|" `
+  --quotechar "'" `
+  --output .\output\standalone.txt
 ```
 
-## Database-derived headers
+This writes 1,000 data records plus the configured header. The `output`
+directory is ignored by Git so generated test data is never committed.
 
-Use a query that returns the required columns. A zero-row `SELECT` is
-recommended because only the result-set column names are used:
+## SQL Server schema-aware generation
 
-```sql
-SELECT TOP (0) order_id, customer_id, amount, created_at_utc
-FROM dbo.orders;
-```
-
-The script rejects connection strings containing a user name or password. Its
-connection string must use the executing person's authentication:
-`Trusted_Connection=Yes`, `Integrated Security=SSPI`, or
-`Authentication=ActiveDirectoryDefault`, `ActiveDirectoryIntegrated`, or
-`ActiveDirectoryInteractive`.
-
-### SQL Server VM with Windows Integrated Authentication
+Use `--engine schema` to discover the table columns without reading source
+rows. Computed and `rowversion`/`timestamp` columns are excluded by default.
+Identity columns remain included because a file-generation workload may need
+them; use the output only where that behavior is appropriate.
 
 ```powershell
-python .\scripts\generate_delimited_file.py .\data\orders.csv --rows 1000000 --connection-string "Driver={ODBC Driver 18 for SQL Server};Server=sqlvm.contoso.com;Database=Sales;Trusted_Connection=Yes;Encrypt=Yes;TrustServerCertificate=Yes;" --header-query "SELECT TOP (0) order_id, customer_id, amount, created_at_utc FROM dbo.orders"
+python .\scripts\generate_delimited_file.py `
+  --server "DESKTOP-6BVBI90" `
+  --database "AdventureWorks2019" `
+  --schema "Sales" `
+  --table "SalesOrderHeaderEnlarged" `
+  --auth windows `
+  --engine schema `
+  --rows 1000 `
+  --output .\output\SalesOrderHeaderEnlarged_schema.csv `
+  --trust-server-certificate
 ```
 
-### Azure SQL Managed Instance with Microsoft Entra Integrated Authentication
+`--auth windows` uses Windows Integrated Authentication
+(`Trusted_Connection=yes`) for the account running Python. The
+`--trust-server-certificate` option is appropriate only for a controlled local
+development SQL Server with an untrusted certificate. Do not use it for normal
+Azure SQL Managed Instance connections.
+
+For Azure SQL Managed Instance, use Microsoft Entra authentication without
+embedding credentials:
 
 ```powershell
-python .\scripts\generate_delimited_file.py .\data\orders.csv --rows 1000000 --connection-string "Driver={ODBC Driver 18 for SQL Server};Server=managed-instance.public.database.windows.net;Database=Sales;Authentication=ActiveDirectoryIntegrated;Encrypt=Yes;TrustServerCertificate=No;" --header-query "SELECT TOP (0) order_id, customer_id, amount, created_at_utc FROM dbo.orders"
+python .\scripts\generate_delimited_file.py `
+  --server "my-mi.public.database.windows.net,3342" `
+  --database "AdventureWorks" `
+  --schema "Sales" `
+  --table "SalesOrderHeader" `
+  --auth entra-default `
+  --engine schema `
+  --rows 1000 `
+  --output .\output\SalesOrderHeader_schema.csv
 ```
 
-For Microsoft Entra authentication, the executing user must already be signed
-in and authorized for the target database. `Authentication=ActiveDirectoryDefault`
-is also suitable when the environment provides that credential.
+Use `--auth entra-interactive` when an interactive Microsoft Entra sign-in is
+required. `entra-default` obtains the current user's token through
+`DefaultAzureCredential`.
 
-## Generated values
+## SDV synthetic data
 
-The script generates deterministic values based on each record number. Known
-column names such as `record_id`, `payload`, and `created_at_utc` receive their
-corresponding default values. Other database-derived column names receive a
-unique `<column-name>_<record-number>` value. This provides valid delimited
-load-test data while preserving the database column names.
+SDV is optional. Install it in an isolated virtual environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r .\requirements-sdv.txt
+.\.venv\Scripts\python.exe .\scripts\generate_delimited_file.py --verify-sdv
+```
+
+With SDV installed, `--engine auto` reads a controlled sample, trains an SDV
+model in memory, and produces synthetic rows:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\generate_delimited_file.py `
+  --server "DESKTOP-6BVBI90" `
+  --database "AdventureWorks2019" `
+  --schema "Sales" `
+  --table "SalesOrderHeaderEnlarged" `
+  --auth windows `
+  --engine auto `
+  --sample-rows 5000 `
+  --rows 10000 `
+  --output .\output\SalesOrderHeaderEnlarged_sdv.csv `
+  --trust-server-certificate
+```
+
+If SDV is unavailable or fails, `--engine auto` falls back to schema-aware
+generation and reports the reason. Use `--engine sdv` or `--no-fallback` when
+failure must stop the command instead. SDV sampling and generation occur in
+memory, so do not use this engine for multi-gigabyte output until chunked
+generation and model reuse are implemented.
+
+## Output options
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--rows` | Required | Number of data records to generate. |
+| `--output` | Required | Generated file path. |
+| `--delimiter` | `,` | One-character field delimiter. |
+| `--quotechar` | `"` | One-character CSV quote character. |
+| `--encoding` | `utf-8` | Output encoding. |
+| `--no-header` | Disabled | Omit the output header row. |
+| `--include-server-generated` | Disabled | Include computed and rowversion/timestamp columns. |
+| `--seed` | `42` | Makes schema-generated values repeatable. |
 
 ## Verification
 
-This script is verified by `tests\test_generate_delimited_file.py` and the
-repository's [GitHub Actions workflow](https://github.com/cbragdon/ADF_Performance_Toolkit/actions/workflows/test.yml).
-The automated checks validate:
+The generator has been tested against the local SQL Server instance
+`DESKTOP-6BVBI90`, database `AdventureWorks2019`, and table
+`Sales.SalesOrderHeaderEnlarged` with Windows Integrated Authentication and
+explicit local certificate trust. Validation confirmed:
 
-- Generation of the requested number of rows with the default headers.
-- Command-line encoding, delimiter, and quote-character options.
-- Database-derived header retrieval through a mocked `pyodbc` connection.
-- Integrated authentication acceptance and rejection of stored SQL credentials.
+- Metadata discovery returned 24 eligible columns in catalog order.
+- Schema generation produced 1,000 rows with the expected header, type/length,
+  decimal-scale, nullability, GUID, and date checks.
+- Standalone pipe-delimited generation produced 1,000 rows plus the header.
+- SDV 2.2.0 trained on a 5,000-row read-only sample and produced 10,000 rows
+  with the expected header.
+- SDV-unavailable fallback and strict SDV failure behavior work as designed.
 
-Run the same verification from the repository root:
+Run the automated unit suite from the repository root:
 
 ```powershell
-python -m unittest tests/test_generate_delimited_file.py -v
+python -m unittest -v tests/test_generate_delimited_file.py
 ```

@@ -1,0 +1,7 @@
+# Optional synthetic-data engine for database sample-driven generation.
+sdv
+pandas
+# Database mode.
+pyodbc
+# Optional Entra user-context token support for --auth entra-default.
+azure-identity

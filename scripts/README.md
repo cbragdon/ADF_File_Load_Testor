@@ -7,6 +7,9 @@ smaller files.
 It is intended to prepare evenly sized source files for Azure Data Factory load
 tests without loading the complete source file into memory.
 
+For synthetic source-file creation, see
+[Delimited File Generator](generate_delimited_file.md).
+
 The script makes two streaming passes over the source: one to count logical
 data records and another to write them. By default, every output file includes
 the source header. Use `--no-header` when every record is data. Python's CSV

@@ -1,0 +1,9 @@
+{
+  "columns": [
+    {"name": "RecordID", "sql_type": "int", "nullable": false, "is_primary_key": true},
+    {"name": "CustomerName", "sql_type": "nvarchar", "nullable": false, "max_length": 80},
+    {"name": "EmailAddress", "sql_type": "nvarchar", "nullable": true, "max_length": 120},
+    {"name": "OrderTotal", "sql_type": "decimal", "nullable": false, "precision": 12, "scale": 2},
+    {"name": "ModifiedDate", "sql_type": "datetime2", "nullable": false}
+  ]
+}
