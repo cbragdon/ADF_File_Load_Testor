@@ -13,6 +13,7 @@ generated_*
 # Documents
 *.docx
 *.pdf
+GENERATE_DELIMITED_FILE_REFACTOR_PLAN.md
 
 # Local environment / secrets
 .env
