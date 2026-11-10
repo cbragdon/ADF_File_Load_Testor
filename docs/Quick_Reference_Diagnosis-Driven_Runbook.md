@@ -1,4 +1,6 @@
-# ADF Copy Activity Performance Tuning - Compact Runbook
+# Quick Reference: Diagnosis-Driven Runbook
+
+> **Actively tuning a load?** Start with the [Quick ADF Copy Activity Performance Tuning Runbook](Quick_ADF_Copy_Activity_Performance_Tuning_Runbook.md). Use this reference when a metric or bottleneck needs deeper interpretation before choosing the next test. For the complete methodology and remediation paths, use the [Full ADF Copy Activity Performance Tuning Runbook](ADF_Copy_Activity_Performance_Tuning_Runbook.md).
 
 Use one rule throughout: **change one variable, run three comparable executions, compare medians, and stop when the next change no longer produces useful improvement.**
 
