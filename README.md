@@ -12,7 +12,8 @@ SQL Managed Instance.
   balanced load-test inputs.
 - `scripts\collect_run_metrics.py` records each load test as a benchmark
   record: the ADF Copy activity result together with SQL sink measurements
-  taken before and after the run.
+  taken before and after the run. On SQL Managed Instance it also shows how
+  close the load came to the instance's published limits.
 - `sql\monitoring\` contains SQL Managed Instance diagnostics for transaction
   log, I/O, waits, and active load behavior.
 - `docs\` contains the ADF performance-tuning runbook and generator design

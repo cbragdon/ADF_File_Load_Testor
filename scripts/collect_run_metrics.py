@@ -83,6 +83,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+# Managed Instance capacity context lives in its own module beside this one.
+# It uses only the standard library and the snapshots taken here.
+import mi_capacity
+
 LOG = logging.getLogger("collect_run_metrics")
 
 # Version of the benchmark record layout. Increase it whenever a field is
@@ -197,6 +201,9 @@ INDEX_COLUMNS: tuple[tuple[str, str], ...] = (
     ("LogRateGovernorWaitMs", "sink.waits.INSTANCE_LOG_RATE_GOVERNOR.wait_time_ms"),
     ("PageIoLatchWaitMs", "sink.pageiolatch_wait_ms"),
     ("LockWaitMs", "sink.lock_wait_ms"),
+    ("MiClassification", "sink.managed_instance.classification"),
+    ("MiLogWritePercentOfLimit", "sink.managed_instance.utilisation_percent.log_write"),
+    ("MiIopsPercentOfLimit", "sink.managed_instance.utilisation_percent.iops"),
     ("CostPerLoad", "cost.cost_per_load"),
     ("CostPerGiB", "cost.cost_per_gib"),
     ("Correctness", "correctness.tester_result"),
@@ -370,6 +377,9 @@ def capture_sql_snapshot(connection: Any, now: Callable[[], datetime] = utc_now)
     * read/write counts, bytes, and stall time for every database file
     * transaction-log size and usage
     * recovery model and the current log-reuse wait reason
+    * on Azure SQL Managed Instance only: the instance's tier, hardware,
+      vCores, and storage, and the I/O counters and size of every file of
+      every database (see mi_capacity.py)
     """
     context_rows = _fetch_dicts(connection, SQL_CONTEXT)
     if not context_rows:
@@ -418,6 +428,12 @@ def capture_sql_snapshot(connection: Any, now: Callable[[], datetime] = utc_now)
             "used_log_space_in_percent": float(log_rows[0]["used_log_space_in_percent"]),
         }
 
+    managed_instance = None
+    if engine_edition == mi_capacity.ENGINE_EDITION_MANAGED_INSTANCE:
+        managed_instance = mi_capacity.capture_mi_snapshot(connection, _fetch_dicts)
+        for part, reason in managed_instance["not_collected"].items():
+            LOG.warning("Managed Instance %s was not collected: %s", part, reason)
+
     return {
         "captured_at_utc": to_iso(now()),
         "sql_captured_at": str(context.get("sql_captured_at")),
@@ -430,6 +446,7 @@ def capture_sql_snapshot(connection: Any, now: Callable[[], datetime] = utc_now)
         "wait_stats": waits,
         "files": files,
         "log_space": log_space,
+        "managed_instance": managed_instance,
     }
 
 
@@ -1127,6 +1144,95 @@ def _show(value: Any, unit: str = "") -> str:
     return f"{text} {unit}".strip()
 
 
+def _render_managed_instance(mi: dict[str, Any]) -> list[str]:
+    """The Managed Instance capacity section of the Markdown record."""
+    if not mi.get("applicable"):
+        return []
+    lines = ["## Managed Instance capacity", ""]
+    if not mi.get("collected"):
+        return lines + [f"**Classification: {mi.get('classification')}**", ""] + \
+            [f"- {line}" for line in mi.get("evidence", [])] + [""]
+    instance, limits = mi.get("instance") or {}, mi.get("limits") or {}
+    observed, used = mi.get("observed") or {}, mi.get("utilisation_percent") or {}
+    classification = mi.get("classification")
+
+    def limit_text(value: Any, unit: str = "") -> str:
+        # Classic General Purpose has limits per file, not one for the instance.
+        if value is None:
+            return "per file (see below)" if limits.get("per_file_limits") else "unknown"
+        return _show(value, unit)
+
+    def percent_text(value: Any) -> str:
+        return "-" if value is None else f"{value:,}%"
+
+    lines += [
+        f"**Classification: {classification}** - {mi_capacity.CLASSIFICATION_MEANING.get(classification, '')}",
+        "",
+        "Waits are the proof that a limit was reached. Percentages are averages over the measurement window "
+        "and can hide short bursts.",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| Service tier | {_show(instance.get('sku'))} |",
+        f"| General Purpose storage (as stated) | {'not applicable' if limits.get('storage') == 'business-critical' else (limits.get('storage') or 'not stated')} |",
+        f"| Hardware | {_show(instance.get('hardware_generation'))} |",
+        f"| vCores | {_show(instance.get('vcores'))} |",
+        f"| Reserved storage | {_show(instance.get('reserved_storage_mb'), 'MB')} |",
+        f"| Storage used at start | {_show(instance.get('storage_used_mb'), 'MB')} |",
+        "",
+        "| Measure | Average in the window | Published limit | Share of the limit |",
+        "| --- | --- | --- | --- |",
+        f"| Log write rate (instance) | {_show(observed.get('log_write_mib_per_second'), 'MiB/s')} | "
+        f"{_show(limits.get('log_write_mib_per_second'), 'MiB/s') if limits.get('log_write_mib_per_second') else 'unknown'} | "
+        f"{percent_text(used.get('log_write'))} |",
+        f"| IOPS (instance) | {_show(observed.get('iops'))} | {limit_text(limits.get('iops'))} | "
+        f"{percent_text(used.get('iops'))} |",
+        f"| Throughput (instance) | {_show(observed.get('throughput_mb_per_second'), 'MB/s')} | "
+        f"{'not limited' if limits.get('storage') == 'business-critical' else limit_text(limits.get('throughput_mb_per_second'), 'MB/s')} | "
+        f"{percent_text(used.get('throughput'))} |",
+        "",
+        f"Limits from Microsoft's resource-limits page, read {mi.get('limits_retrieved')} "
+        f"({mi.get('limits_version')}): {mi.get('limits_source')}",
+        "",
+    ]
+    if mi.get("evidence"):
+        lines += ["### Evidence", ""] + [f"- {line}" for line in mi["evidence"]] + [""]
+    notes = list(limits.get("notes") or [])
+    notes += [f"{part.capitalize()} not collected: {reason}" for part, reason in (mi.get("not_collected") or {}).items()]
+    if notes:
+        lines += ["### Notes on the limits", ""] + [f"- {note}" for note in notes] + [""]
+    if mi.get("databases"):
+        lines += [
+            "### I/O by database during the window",
+            "",
+            "| Database | Share of I/O | IOPS | MiB/s | Log MiB/s |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for d in mi["databases"]:
+            name = f"{d['database_name']} (target)" if d.get("is_target") else d["database_name"]
+            lines.append(
+                f"| {name} | {_show(d.get('share_of_io_percent'), '%')} | {_show(d.get('iops'))} | "
+                f"{_show(d.get('mib_per_second'))} | {_show(d.get('log_write_mib_per_second'))} |"
+            )
+        lines.append("")
+    if mi.get("files"):
+        lines += [
+            "### Busiest files",
+            "",
+            "| File | Type | Size (GiB) | IOPS | MiB/s | File limit (IOPS / MiB/s) | Read ms | Write ms |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for f in mi["files"][:10]:
+            limit = (f"{f['iops_limit']:,} / {f['mib_per_second_limit']}" if f.get("iops_limit") else "none")
+            lines.append(
+                f"| {f['database_name']}.{f['logical_file_name']} | {f['file_type']} | {_show(f.get('size_gib'))} | "
+                f"{_show(f.get('iops'))} | {_show(f.get('mib_per_second'))} | {limit} | "
+                f"{_show(f.get('read_latency_ms'))} | {_show(f.get('write_latency_ms'))} |"
+            )
+        lines.append("")
+    return lines
+
+
 def render_markdown(record: dict[str, Any]) -> str:
     """Render the record for people, using the field names of runbook section 11."""
     test, source, settings = record["test"], record["source"], record["settings"]
@@ -1233,6 +1339,7 @@ def render_markdown(record: dict[str, Any]) -> str:
                 f"{_show(w.get('signal_wait_time_ms'))} |"
             )
         lines.append("")
+        lines += _render_managed_instance(sink.get("managed_instance") or {})
 
     lines += [
         "## Cost",
@@ -1355,6 +1462,8 @@ def command_start(args: argparse.Namespace) -> int:
     # attempt are removed so that results from two attempts are never mixed.
     for stale in STALE_ON_RESTART:
         (test_dir / stale).unlink(missing_ok=True)
+    if args.mi_iops is not None and args.mi_iops <= 0:
+        raise ValueError("--mi-iops must be a positive whole number.")
     _attach_file_log(test_dir)
 
     session: dict[str, Any] = {
@@ -1365,6 +1474,9 @@ def command_start(args: argparse.Namespace) -> int:
         "host": platform.node(),
         "sql": None,
         "snapshot": None,
+        # What the tester states about a Managed Instance sink. Used only when
+        # the sink turns out to be a Managed Instance; see mi_capacity.py.
+        "managed_instance_stated": {"gp_storage": args.mi_gp_storage, "iops": args.mi_iops},
     }
 
     if args.no_sql:
@@ -1475,6 +1587,28 @@ def _wait_for_completion(args: argparse.Namespace, started_at: datetime) -> dict
     return wait_for_pipeline_run(check, args.poll_seconds, args.timeout_hours * 3600)
 
 
+def _assess_managed_instance(session: dict[str, Any], after: dict[str, Any], deltas: dict[str, Any]) -> dict[str, Any]:
+    """Add Managed Instance capacity context to the SQL deltas.
+
+    Other platforms are marked not applicable. Warnings from the assessment
+    join the record's warnings.
+    """
+    before = session["snapshot"]
+    if before.get("engine_edition") != mi_capacity.ENGINE_EDITION_MANAGED_INSTANCE:
+        return {"applicable": False}
+    assessment = mi_capacity.assess(
+        before.get("managed_instance"),
+        after.get("managed_instance"),
+        deltas.get("measurement_window_seconds"),
+        deltas.get("waits", {}),
+        session.get("managed_instance_stated"),
+        before.get("database_name"),
+    )
+    deltas["warnings"].extend(assessment.pop("warnings", []))
+    LOG.info("Managed Instance assessment: %s.", assessment.get("classification"))
+    return assessment
+
+
 def command_stop(args: argparse.Namespace) -> int:
     """Take the 'after' snapshot, read the ADF result, and write the benchmark record."""
     test_dir = _test_dir(args)
@@ -1549,6 +1683,7 @@ def command_stop(args: argparse.Namespace) -> int:
                 connection.close()
             write_json(after_path, after_snapshot)
         sink_deltas = compute_sql_deltas(session["snapshot"], after_snapshot)
+        sink_deltas["managed_instance"] = _assess_managed_instance(session, after_snapshot, sink_deltas)
         stopped_at = from_iso(after_snapshot["captured_at_utc"])
         LOG.info("'After' snapshot ready; measurement window %.0f s.", sink_deltas["measurement_window_seconds"])
     else:
@@ -1673,6 +1808,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Trust the presented server certificate; controlled development use only")
     start.add_argument("--no-sql", action="store_true",
                        help="Do not collect SQL measurements (use when the sink is not a SQL database)")
+    mi = start.add_argument_group("Azure SQL Managed Instance sinks only (ignored on other platforms)")
+    mi.add_argument("--mi-gp-storage", choices=mi_capacity.GP_STORAGE_CHOICES,
+                    help="General Purpose storage type of the instance; needed to judge storage limits")
+    mi.add_argument("--mi-iops", type=int,
+                    help="Next-gen General Purpose only: total IOPS set on the instance, when extra IOPS were bought")
     start.add_argument("--force", action="store_true", help="Replace an existing 'before' snapshot for this test ID")
     start.set_defaults(handler=command_start)
 

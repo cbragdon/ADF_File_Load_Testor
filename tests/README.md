@@ -38,15 +38,16 @@ once.
 
 # Run Collector Tests
 
-`test_collect_run_metrics.py` verifies `scripts\collect_run_metrics.py`. The
-tests need no database, no Azure access, and no third-party packages. SQL is
+`test_collect_run_metrics.py` verifies `scripts\collect_run_metrics.py`, and
+`test_mi_capacity.py` verifies its Managed Instance check in
+`scripts\mi_capacity.py`. The tests need no database, no Azure access, and no third-party packages. SQL is
 replaced by a fake connection that returns prepared rows, and the Azure REST
 call is replaced by a fake that returns prepared pages.
 
 ## Run the tests
 
 ```powershell
-python -m unittest tests/test_collect_run_metrics.py -v
+python -m unittest tests/test_collect_run_metrics.py tests/test_mi_capacity.py -v
 ```
 
 ## What the tests verify
@@ -60,3 +61,4 @@ python -m unittest tests/test_collect_run_metrics.py -v
 | Benchmark record | Holds every runbook section 11 field; warns about failed copies, row mismatches, skipped rows, and a measurement window much longer than the copy. |
 | Commands | `start`, `stop`, and `list` run end to end; existing results are never replaced without `--force`; a failed `stop` reuses its "after" snapshot when run again; the verdict is required before anything is measured; no secret is written to disk. |
 | Waiting (`stop --wait`) | Finds the run by pipeline name or ID and follows it through Queued and InProgress to a final status; times out; retries passing faults and stops on lasting ones; reads nothing from the sink while waiting; `--snapshot-only` then a saved file completes the record; Ctrl+C keeps the "before" snapshot. |
+| Managed Instance check | The instance description and every database's files are read only on Managed Instance, and a denied permission is recorded instead of failing the snapshot; published limits are applied for classic and Next-gen General Purpose and Business Critical; the General Purpose storage type is never guessed; governor waits, near-limit averages, and busy slow files give the right classification; `tempdb` is handled by tier; another busy database, a scaled instance, and reset counters are warned about; the section appears in the record and the index. |

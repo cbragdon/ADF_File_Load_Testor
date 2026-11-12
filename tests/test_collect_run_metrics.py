@@ -41,6 +41,11 @@ WAIT_COLUMNS = ["wait_type", "waiting_tasks_count", "wait_time_ms", "signal_wait
 FILE_COLUMNS = ["file_id", "logical_file_name", "file_type", "num_of_reads", "num_of_writes",
                 "num_of_bytes_read", "num_of_bytes_written", "io_stall_read_ms", "io_stall_write_ms"]
 LOG_COLUMNS = ["total_log_size_in_bytes", "used_log_space_in_bytes", "used_log_space_in_percent"]
+MI_INSTANCE_COLUMNS = ["sku", "hardware_generation", "virtual_core_count", "reserved_storage_mb",
+                       "storage_space_used_mb"]
+MI_FILE_COLUMNS = ["database_id", "database_name", "file_id", "logical_file_name", "file_type", "size_bytes",
+                   "num_of_reads", "num_of_writes", "num_of_bytes_read", "num_of_bytes_written",
+                   "io_stall_read_ms", "io_stall_write_ms"]
 
 
 class FakeCursor:
@@ -58,6 +63,10 @@ class FakeCursor:
             columns, rows = CONTEXT_COLUMNS, data["context"]
         elif "wait_stats" in sql:
             columns, rows = WAIT_COLUMNS, data["waits"]
+        elif "server_resource_stats" in sql:
+            columns, rows = MI_INSTANCE_COLUMNS, data["mi_instance"]
+        elif "master_files" in sql:  # the instance-wide file query (Managed Instance only)
+            columns, rows = MI_FILE_COLUMNS, data["mi_files"]
         elif "dm_io_virtual_file_stats" in sql:
             columns, rows = FILE_COLUMNS, data["files"]
         elif "dm_db_log_space_usage" in sql:
@@ -101,6 +110,14 @@ def sql_data(engine_edition=8, writelog_ms=1000, log_writes=100, log_bytes=1 * G
             (2, "LoadTest_log", "LOG", 10, log_writes, 0, log_bytes, 0, log_stall),
         ],
         "log": [(total_log_bytes, used_log_bytes, 100.0 * used_log_bytes / total_log_bytes)],
+        # Managed Instance context: an 8-vCore General Purpose instance, and the
+        # same two files seen instance-wide, plus a quiet second database.
+        "mi_instance": [("General Purpose", "Gen5", 8, 1048576, 204800.0)],
+        "mi_files": [
+            (5, "LoadTest", 1, "LoadTest", "ROWS", 100 * GIB, 1000, data_writes, 2 * GIB, 4 * GIB, 900, 800),
+            (5, "LoadTest", 2, "LoadTest_log", "LOG", 20 * GIB, 10, log_writes, 0, log_bytes, 0, log_stall),
+            (6, "Other", 1, "Other", "ROWS", 10 * GIB, 50, 5, 0, 0, 10, 10),
+        ],
     }
 
 
@@ -208,6 +225,24 @@ class SqlSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["wait_stats_scope"], "database")
         self.assertTrue(any("sys.dm_db_wait_stats" in sql for sql in connection.executed))
         self.assertFalse(any("sys.dm_os_wait_stats" in sql for sql in connection.executed))
+
+    def test_managed_instance_context_is_read_only_on_managed_instance(self):
+        snapshot = c.capture_sql_snapshot(FakeConnection(sql_data(engine_edition=8)), now=at(21, 0))
+        mi = snapshot["managed_instance"]
+        self.assertEqual(mi["instance"]["vcores"], 8)
+        self.assertEqual(len(mi["files"]), 3)
+        connection = FakeConnection(sql_data(engine_edition=c.ENGINE_EDITION_AZURE_SQL_DATABASE))
+        snapshot = c.capture_sql_snapshot(connection, now=at(21, 0))
+        self.assertIsNone(snapshot["managed_instance"])
+        self.assertFalse(any("server_resource_stats" in sql or "master_files" in sql for sql in connection.executed))
+
+    def test_missing_permission_for_context_does_not_fail_the_snapshot(self):
+        data = sql_data()
+        del data["mi_instance"]  # the fake now fails that query, as a denied permission would
+        snapshot = c.capture_sql_snapshot(FakeConnection(data), now=at(21, 0))
+        self.assertIsNone(snapshot["managed_instance"]["instance"])
+        self.assertIn("instance", snapshot["managed_instance"]["not_collected"])
+        self.assertEqual(snapshot["wait_stats"]["WRITELOG"]["wait_time_ms"], 1000)
 
     def test_every_query_is_a_select(self):
         connection = FakeConnection(sql_data())
@@ -474,7 +509,7 @@ class CommandLineTests(unittest.TestCase):
             with patch.object(c, "open_sql_connection", side_effect=fake_open):
                 code, _ = self.run_main("start", "--test-id", "T01", "--output-dir", str(out),
                                         "--server", "sqlmi-dev.example", "--database", "LoadTest",
-                                        "--auth", "entra-default")
+                                        "--auth", "entra-default", "--mi-gp-storage", "classic")
                 self.assertEqual(code, 0)
 
                 # First 'stop' fails after the snapshot because the ADF file name is wrong.
@@ -499,6 +534,20 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(record["sink"]["waits"]["WRITELOG"]["wait_time_ms"], 3000)
             self.assertEqual(record["sink"]["log_io"]["gib_written"], 2.0)
             self.assertEqual(record["test"]["sql_server"], "sqlmi-dev.example")
+
+            # Managed Instance capacity context, judged against the stated storage type.
+            self.assertEqual(before["managed_instance_stated"], {"gp_storage": "classic", "iops": None})
+            mi = record["sink"]["managed_instance"]
+            self.assertTrue(mi["applicable"])
+            self.assertEqual(mi["limits"]["storage"], "classic")
+            self.assertIn(mi["classification"], c.mi_capacity.CLASSIFICATION_MEANING)
+            self.assertEqual(mi["limits_version"], c.mi_capacity.LIMITS_VERSION)
+            markdown = (out / "T01" / "benchmark_record.md").read_text(encoding="utf-8")
+            self.assertIn("## Managed Instance capacity", markdown)
+            self.assertIn("LoadTest (target)", markdown)
+            with (out / "benchmark_index.csv").open("r", encoding="utf-8-sig", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["MiClassification"], mi["classification"])
 
     def test_existing_results_are_never_replaced_silently(self):
         with tempfile.TemporaryDirectory() as td:

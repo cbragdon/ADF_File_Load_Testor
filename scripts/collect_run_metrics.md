@@ -32,6 +32,13 @@ whether that takes five minutes or five hours. This is the normal way to
 finish a test. Other ways are described under
 [Other ways to finish a test](#other-ways-to-finish-a-test).
 
+**On Azure SQL Managed Instance, the record also says how close the load came
+to the instance's limits.** It compares the load's log write rate and I/O with
+the limits Microsoft publishes for the instance's tier and size, shows which
+databases did the I/O, and gives a one-word classification with the evidence
+behind it. See
+[How the Managed Instance check works](#how-the-managed-instance-check-works).
+
 The script is read-only against SQL. It selects from system views and changes
 nothing.
 
@@ -52,7 +59,7 @@ python -m pip install pyodbc azure-identity
 
 | Where | What you need | Why |
 | --- | --- | --- |
-| SQL Server and SQL Managed Instance | Permission to view server state | Wait statistics and file I/O counters are server-level views |
+| SQL Server and SQL Managed Instance | Permission to view server state | Wait statistics and file I/O counters are server-level views. On Managed Instance the same permission also covers the instance description and the file list for every database. If it is missing for those two, the record says "not collected" and the rest of the test is unaffected. |
 | Azure SQL Database | Permission to view database state | The database-scoped wait and I/O views are used |
 | Data factory | Read access to the factory's pipeline runs | To check the run's status and read the Copy activity result. Not needed only when you [stop by hand](#stop-by-hand-without-waiting) with a saved file |
 
@@ -164,7 +171,8 @@ python .\scripts\collect_run_metrics.py start `
     --environment sandbox `
     --server sqlmi-dev.example.database.windows.net `
     --database LoadTest `
-    --auth entra-default
+    --auth entra-default `
+    --mi-gp-storage classic
 ```
 
 | Parameter | What to put in it | Where to find it |
@@ -174,6 +182,8 @@ python .\scripts\collect_run_metrics.py start `
 | `--server` | The SQL server the pipeline loads into (the sink). | **SQL Managed Instance:** Azure portal, open the managed instance, **Overview**, **Host**. **Azure SQL Database:** Azure portal, open the database, **Overview**, **Server name**. **SQL Server on a VM:** the VM's host name or DNS name. Add `,port` at the end if SQL Server doesn't listen on 1433, for example `sqlvm01.contoso.local,14330`. |
 | `--database` | The name of the database the pipeline loads into. | The sink dataset or linked service in ADF Studio, or the database list in SSMS. |
 | `--auth` | How you sign in to SQL. `entra-default` uses your existing Azure sign-in with no prompt. `entra-interactive` opens a browser sign-in. `windows` uses your Windows sign-in. The default is `windows`. | Use `entra-default` or `entra-interactive` for Managed Instance and Azure SQL Database. Use `windows` for a SQL Server VM joined to your domain. |
+| `--mi-gp-storage` | **General Purpose Managed Instance only.** Which kind of General Purpose storage the instance uses: `classic` or `next-gen`. They have different limits, and SQL can't tell them apart reliably, so the collector asks rather than guesses. Without it, the record still shows the waits, the log write rate, and the I/O by database, but storage limits aren't judged. Leave it out for Business Critical and for other platforms. | Azure portal, open the managed instance, **Compute + storage**. If **Next-gen General Purpose** shows as enabled, use `next-gen`; otherwise `classic`. Or run `az sql mi show --name <instance> --resource-group <group> --query isGeneralPurposeV2`: `true` means `next-gen`. |
+| `--mi-iops` | **Next-gen General Purpose only, and only if extra IOPS were bought.** The instance's total IOPS. Without it, the collector assumes the included IOPS (3 per GB of reserved storage) and says so in the record. | Azure portal, the managed instance, **Compute + storage**, the IOPS setting. |
 
 Only `--test-id` is always needed. `--server` and `--database` are needed
 unless you add `--no-sql`, which skips SQL measurements. Use that only when
@@ -268,6 +278,10 @@ python .\scripts\collect_run_metrics.py list
 ```
 
 This prints one line per recorded test and rebuilds the index file.
+
+Open `benchmark_record.md` in the test folder to read the whole record. On a
+Managed Instance, read its **Managed Instance capacity** section and its
+warnings before comparing the run with others.
 
 ## Other ways to finish a test
 
@@ -406,7 +420,8 @@ be checked and changed without reading the code first.
    No connection is held open during the load.
 7. **Writes `before.json`.** It holds the snapshot and the connection details
    `stop` needs to reach the same database: server, database, sign-in mode,
-   driver, and encryption settings. It holds no password, key, or token,
+   driver, and encryption settings. It also keeps what you stated with
+   `--mi-gp-storage` and `--mi-iops`. It holds no password, key, or token,
    because the collector never receives one.
 
 ### What `stop` does
@@ -433,6 +448,8 @@ be checked and changed without reading the code first.
      snapshot later would stretch the window beyond the load.
 6. **Calculates the differences** between the two snapshots (see
    [How the differences are calculated](#how-the-differences-are-calculated)).
+   On a Managed Instance it then runs the capacity check (see
+   [How the Managed Instance check works](#how-the-managed-instance-check-works)).
    With `--snapshot-only`, the command ends here.
 7. **Obtains the Copy activity result,** from the file or from Azure (see
    [How the ADF result is read](#how-the-adf-result-is-read)), and saves it
@@ -492,6 +509,8 @@ Every query is a `SELECT` against a system view. Nothing is changed.
 | Waits | `sys.dm_os_wait_stats`, or `sys.dm_db_wait_stats` on Azure SQL Database | Waiting tasks, wait time, and signal wait time for the ten tracked wait types |
 | File I/O | `sys.dm_io_virtual_file_stats` joined to `sys.database_files` | Per file: reads, writes, bytes read and written, and read and write stall time |
 | Log space | `sys.dm_db_log_space_usage` | Total log size, used log space, and percentage used |
+| Instance (Managed Instance only) | `sys.server_resource_stats`, newest row | Service tier, hardware, vCores, reserved storage, and storage used |
+| All files (Managed Instance only) | `sys.dm_io_virtual_file_stats(NULL, NULL)` joined to `sys.master_files` | For every file of every database: its size and the same I/O counters as above. One query; no database is switched into. |
 
 The wait view is chosen from the engine edition. Azure SQL Database (engine
 edition 5) does not let database users read the instance-wide view, so the
@@ -520,6 +539,70 @@ The ten tracked wait types are the same as in
   the test, as described for script 06 in the monitoring guide.
 - **Log usage.** Recorded from both snapshots. If the log's total size grew,
   the record warns that the run is hard to compare with others.
+
+### How the Managed Instance check works
+
+This runs only when the sink is an Azure SQL Managed Instance. It adds nothing
+to the load: it uses the two snapshots already taken, with two extra queries in
+each (see [What a snapshot reads](#what-a-snapshot-reads)). It reads nothing
+while the load runs, and it never suggests changes. Its job is to give a DBA
+enough evidence to make the call.
+
+It answers three questions:
+
+1. **Did the load reach a limit?** The proof is a wait. If
+   `INSTANCE_LOG_RATE_GOVERNOR` time grew during the test, the engine held log
+   writes back because the instance's log limit was reached. That counts as
+   reached, however small the amount; the record shows the figure so you can
+   judge how much it mattered.
+2. **How close did it come?** The load's average log write rate, IOPS, and
+   throughput are compared with the published limits for this instance. These
+   are averages over the whole window, so they show how close the load ran,
+   not its peaks. A short burst can hit a limit while the average stays well
+   below it.
+3. **Was the instance shared?** I/O is broken down by database. If another
+   database did more than 25% of the instance's I/O during the test, the
+   record warns that the load didn't have the instance to itself.
+
+**Which limits apply.** The numbers come from Microsoft's
+[resource limits page](https://learn.microsoft.com/azure/azure-sql/managed-instance/resource-limits),
+read on 12 November 2026. Every record names that version, so you can tell
+which numbers it was judged against. They are kept in `scripts\mi_capacity.py`
+and should be updated there when Microsoft changes the page.
+
+| Instance | Log write limit (instance) | I/O limit | Throughput limit |
+| --- | --- | --- | --- |
+| General Purpose, classic | 4.5 MiB/s per vCore, at most 120 MiB/s | Per file, by file size: 500 IOPS up to 129 GiB, 2,300 up to 513 GiB, 5,000 up to 1,025 GiB, 7,500 above | Per file: 100, 150, 200, then 250 MiB/s for the same sizes |
+| General Purpose, Next-gen | 4.5 MiB/s per vCore, at most 120 MiB/s (standard-series) or 192 MiB/s (premium-series) | One pool for the instance: 3 IOPS per GB of reserved storage (at least 300), or the total set with `--mi-iops`, up to a cap for the vCore count | IOPS divided by 30, in MB/s (at least 75), up to a cap for the vCore count |
+| Business Critical | 16 MiB/s per vCore, at most 160 MiB/s (standard-series) or 192 MiB/s (premium-series) | 4,000 IOPS per vCore, at most 320,000 | Not limited |
+
+In General Purpose, `tempdb` sits on local disk outside these limits, so its
+I/O is left out of the instance totals and has no file limit. In Business
+Critical it shares the instance's IOPS, so it is included.
+
+When the collector can't work out a limit, it says "unknown" and gives the
+reason under **Notes on the limits**. It never fills the gap with a guess.
+This happens when `--mi-gp-storage` wasn't given for a General Purpose
+instance, or when the hardware isn't recognised and the limit depends on it.
+
+**The classification.** It uses the same names and thresholds as
+`sql\monitoring\azure_sql_mi_file_diagnostic_v2-3.sql`: a value at 70% or more
+of its limit is "near the limit", and I/O slower than 15 ms is "slow".
+
+| Classification | What it means |
+| --- | --- |
+| `INSTANCE_LEVEL` | Log governor waits during the test, or an instance-wide average at 70% or more of its limit |
+| `FILE_LEVEL` | One or more files at 70% or more of their own limit and slower than 15 ms, while the instance was not under pressure (classic General Purpose only) |
+| `MIXED` | Both of the above |
+| `NOT_PROVEN` | Some I/O was slower than 15 ms, but nothing was near a known limit. Look elsewhere before blaming storage limits. |
+| `HEALTHY` | Nothing near a limit and no slow I/O |
+| `NO_ACTIVITY` | No file I/O in the window |
+| `NOT_ASSESSED` | Not enough was collected or stated to judge, for example a General Purpose instance without `--mi-gp-storage` and no waits to go on |
+
+Under the classification, the record lists the evidence behind it: the wait
+times, each average next to its limit, and each file that was near its limit
+or slow. It also lists the I/O by database and the ten busiest files, each
+with its size, IOPS, MiB/s, file limit, and latency.
 
 ### How the ADF result is read
 
@@ -568,6 +651,9 @@ Besides the SQL warnings above, the record warns when:
 - with `--wait`, the pipeline run ended with a status other than Succeeded
 - with `--wait`, the "after" snapshot was taken more than two check intervals
   plus 60 seconds after the run ended
+- on Managed Instance: another database did more than 25% of the instance's
+  I/O, the instance's tier, vCores, or storage changed during the test, or a
+  file's counters were reset
 
 ## How the record maps to the runbook
 
@@ -618,6 +704,8 @@ before comparing runs.
 | The transaction log grew during the test | Log growth happened inside the run | Do not compare this run with runs that started with space already allocated |
 | Rows read do not equal rows copied | Rows were skipped or the copy failed | Treat the run as a correctness failure until explained |
 | Configured values are unknown | Only the activity output was supplied | Let `stop --wait` read the result from Azure, or save input and output together |
+| Another database did more than 25% of the instance's I/O | Something else was busy on the Managed Instance during the test | Find out what it was, and repeat the test when the instance is quiet |
+| The instance's tier, hardware, vCores, or reserved storage changed | The Managed Instance was scaled during the test | Repeat the test; a scaling operation also fails the instance over |
 
 ## Safe to repeat
 
@@ -641,6 +729,16 @@ Scripts 01, 03, 04, 05, and 08 look at conditions *during* a load or at file
 configuration. The collector does not replace them. Use them while a long load
 is running, as the monitoring guide describes.
 
+`azure_sql_mi_file_diagnostic_v2-3.sql` and the collector's Managed Instance
+check ask the same question in different ways. The script takes a live
+five-second sample, so use it while a load is running. The collector covers the
+whole load, from `start` to `stop`. The collector also differs in three ways:
+it uses the current published limits (some of the script's file limits are
+older values), it doesn't infer Next-gen General Purpose from the storage size
+but asks you with `--mi-gp-storage`, and it records evidence without
+suggesting changes. If the two disagree, the collector's averages may be
+hiding a burst that the script's sample caught.
+
 ## Limits
 
 - **One Copy activity per record.** If the pipeline has several, name the one
@@ -659,12 +757,28 @@ is running, as the monitoring guide describes.
   covered.
 - **Sinks other than SQL.** Use `start --no-sql`. The record then holds the ADF
   result and the tester's notes, and states that SQL was not measured.
+- **Managed Instance: averages, not peaks.** Usage is averaged over the whole
+  window. Waits show whether a limit was reached; averages only show how close
+  the load ran.
+- **Managed Instance: the per-database log limit isn't judged.** Classic
+  General Purpose also limits each database's log rate (22 to 65 MiB/s,
+  depending on the log file's size), but Microsoft doesn't publish the value
+  for each size. Only the instance limit is judged.
+- **Managed Instance: published limits are approximate.** Microsoft describes
+  them as approximate, and automatic backups use some of the IOPS. A value just
+  under a limit may already be at it.
+- **Managed Instance: file sizes come from `sys.master_files`.** On classic
+  General Purpose a file's limit depends on its size, so a file that grew
+  during the test is judged by its size at `stop`.
 
 ## Verification status
 
 The script is covered by `tests\test_collect_run_metrics.py`, which runs
 without a database or Azure access by simulating SQL results and Azure
 responses.
+
+The Managed Instance check is covered by `tests\test_mi_capacity.py` in the
+same way.
 
 It has not yet been run against a live SQL sink or a live data factory. On
 first use, check one record by hand:
@@ -673,6 +787,10 @@ first use, check one record by hand:
    guide describes.
 2. Compare their deltas with the `sink` section of `benchmark_record.json`.
 3. Compare the ADF values with the Copy activity's monitoring view.
+4. On a Managed Instance, run `azure_sql_mi_file_diagnostic_v2-3.sql` during
+   the load, and check that the tier, vCores, storage, and busiest files match
+   the record's **Managed Instance capacity** section. Expect the script's
+   file limits to differ where it uses older values.
 
 ## Troubleshooting
 
@@ -691,3 +809,5 @@ first use, check one record by hand:
 | `did not finish within ... hours` | The run is still going when the timeout ends | Run the same command again, or raise `--timeout-hours` |
 | `failed status checks in a row` | Azure couldn't be reached for about five minutes | Check the network or VPN, then run the same command again |
 | Status stays `not started yet` | The pipeline wasn't started, or `--pipeline-name` is wrong | Start the pipeline, or check the name in ADF Studio |
+| `Managed Instance instance was not collected` or `files was not collected` | Your sign-in can't view server state | Ask for the permission; the rest of the record is still valid |
+| Classification `NOT_ASSESSED` on General Purpose | `--mi-gp-storage` wasn't given on `start` | Give it on the next test's `start`; see step 1 |
