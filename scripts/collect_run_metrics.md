@@ -177,7 +177,9 @@ python .\scripts\collect_run_metrics.py start `
     --server sqlmi-dev.example.database.windows.net `
     --database LoadTest `
     --auth entra-default `
-    --mi-gp-storage classic
+    --mi-gp-storage classic `
+    --change "DIU 4 -> 8" `
+    --target-table-design "heap, no indexes"
 ```
 
 | Parameter | What to put in it | Where to find it |
@@ -189,6 +191,12 @@ python .\scripts\collect_run_metrics.py start `
 | `--auth` | How you sign in to SQL. `entra-default` uses your existing Azure sign-in with no prompt. `entra-interactive` opens a browser sign-in. `windows` uses your Windows sign-in. The default is `windows`. | Use `entra-default` or `entra-interactive` for Managed Instance and Azure SQL Database. Use `windows` for a SQL Server VM joined to your domain. |
 | `--mi-gp-storage` | **General Purpose Managed Instance only.** Which kind of General Purpose storage the instance uses: `classic` or `next-gen`. They have different limits, and SQL can't tell them apart reliably, so the collector asks rather than guesses. Without it, the record still shows the waits, the log write rate, and the I/O by database, but storage limits aren't judged. Leave it out for Business Critical and for other platforms. | Azure portal, open the managed instance, **Compute + storage**. If **Next-gen General Purpose** shows as enabled, use `next-gen`; otherwise `classic`. Or run `az sql mi show --name <instance> --resource-group <group> --query isGeneralPurposeV2`: `true` means `next-gen`. |
 | `--mi-iops` | **Next-gen General Purpose only, and only if extra IOPS were bought.** The instance's total IOPS. Without it, the collector assumes the included IOPS (3 per GB of reserved storage) and says so in the record. | Azure portal, the managed instance, **Compute + storage**, the IOPS setting. |
+| `--change` | What is different about this test, in a few words, for example `DIU 4 -> 8` or `baseline`. Optional, but it is what makes a list of tests easy to compare later: without it, each row is just numbers. Put it in quotes. | You know it: it's the setting you changed for this test. |
+| `--target-table-design` | How the sink table is built, for example `heap, no indexes` or `clustered index + 2 nonclustered`. Optional. Put it in quotes. | The table's definition in SSMS. |
+
+`--change` and `--target-table-design` describe the test, so you give them
+here, before the load. You judge the result later, when `stop` asks you (see
+[When the pipeline finishes](#when-the-pipeline-finishes)).
 
 Only `--test-id` is always needed. `--server` and `--database` are needed
 unless you add `--no-sql`, which skips SQL measurements. Use that only when
@@ -216,12 +224,7 @@ python .\scripts\collect_run_metrics.py stop `
     --pipeline-name PL_Blob_to_SqlMi_Orders `
     --subscription-id 00000000-0000-0000-0000-000000000000 `
     --resource-group rg-data-dev `
-    --factory adf-data-dev `
-    --change "DIU 4 -> 8" `
-    --target-table-design "heap, no indexes" `
-    --correctness "row counts match" `
-    --result PASS `
-    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
+    --factory adf-data-dev
 ```
 
 | Parameter | What to put in it | Where to find it |
@@ -232,17 +235,9 @@ python .\scripts\collect_run_metrics.py stop `
 | `--subscription-id` | The ID of the Azure subscription that holds the data factory. It looks like `00000000-0000-0000-0000-000000000000`. | Azure portal, open the data factory, **Overview**, **Subscription ID**. If your Azure CLI is already set to that subscription, `az account show --query id` prints it too. |
 | `--resource-group` | The resource group the data factory is in. | Azure portal, open the data factory, **Overview**, **Resource group**. |
 | `--factory` | The data factory's name. | Azure portal, the name at the top of the data factory's page. ADF Studio also shows it at the top of the screen. |
-| `--change` | What is different about this test, in a few words, for example `DIU 4 -> 8` or `baseline`. Optional, but it makes tests easy to compare later. | You describe it. |
-| `--target-table-design` | How the sink table is built, for example `heap, no indexes` or `clustered index + 2 nonclustered`. Optional. | The table's definition in SSMS. |
-| `--correctness` | Whether the data arrived correctly, for example `row counts match`. Optional. | Your own check after the load. |
-| `--result` | Your verdict: `PASS`, `FAIL`, or `INVESTIGATE`. | You decide. |
-| `--next-action-reason` | One sentence on what this result tells you to do next, and why. Put it in quotes. | You decide. |
-
-`--result` and `--next-action-reason` are required. If you leave them out, the
-script asks for them once the pipeline has finished, so you can decide after
-you have seen the run. The runbook treats the reason for the next action as the
-point of the record: it stops tuning from becoming a sequence of unexplained
-setting changes.
+These parameters only tell `stop` which pipeline to follow and where to
+read its result. Nothing here asks you to judge the test; that comes after
+the load.
 
 Optional parameters for waiting:
 
@@ -275,6 +270,26 @@ Things to know:
   the same command again to carry on.
 - **Keep the computer awake.** If it sleeps, the checks pause and the "after"
   snapshot is taken late. The record warns you when that happens.
+- **Leave the window open.** When the pipeline finishes, `stop` asks you
+  three questions in it.
+
+#### When the pipeline finishes
+
+`stop` takes the "after" snapshot and reads the Copy activity result first,
+so the measurement is saved before it asks anything. Then it prints
+"Pipeline finished and measured" and asks three questions. Answer them
+whenever you're back; the time you take changes nothing that was measured.
+
+| Question | What to answer | Needed? |
+| --- | --- | --- |
+| Did the data arrive correctly? | Your own check after the load, for example `row counts match`. The record also checks on its own that rows read equal rows copied. | Optional. Press Enter to skip. |
+| Result | `PASS`, `FAIL`, or `INVESTIGATE`. | Required. |
+| Reason for the next action | One sentence on what this result tells you to do next, and why, for example `Throughput rose 30% with no log governor waits; test 16 DIU next.` | Required. |
+
+The runbook treats the reason for the next action as the point of the record:
+it stops tuning from becoming a sequence of unexplained setting changes.
+
+After the last answer, the record is written.
 
 ### 4. Review
 
@@ -302,30 +317,25 @@ once.
 1. **Wait and take the snapshot.** Run step 3's command with
    `--snapshot-only` added. Fill in `--test-id`, `--pipeline-name`,
    `--subscription-id`, `--resource-group`, and `--factory` as described in
-   step 3. You can leave out `--result`, `--next-action-reason`, and the other
-   notes for now. It waits for the pipeline, takes the "after" snapshot when it
-   finishes, and stops.
+   step 3. It waits for the pipeline, takes the "after" snapshot when it
+   finishes, and stops without asking any questions.
 2. **Save the Copy activity result.** In ADF Studio, open the pipeline run on
    the Monitor tab, select the Copy activity's **Output** link, and save the
    JSON to a file.
 3. **Finish the record.** This does not take another snapshot. It uses the one
-   taken in part 1 and adds the ADF result.
+   taken in part 1, adds the ADF result, and asks the
+   [three questions](#when-the-pipeline-finishes).
 
 ```powershell
 python .\scripts\collect_run_metrics.py stop `
     --test-id DIU-08-run1 `
-    --adf-output-file .\output\adf\DIU-08-run1.json `
-    --change "DIU 4 -> 8" `
-    --result PASS `
-    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
+    --adf-output-file .\output\adf\DIU-08-run1.json
 ```
 
 | Parameter | What to put in it |
 | --- | --- |
 | `--test-id` | The same test ID you gave `start`. |
 | `--adf-output-file` | The path to the file you saved in part 2. A path starting with `.\` is relative to the repository root. Put the path in quotes if it contains spaces. |
-| `--change`, `--target-table-design`, `--correctness` | As described in step 3. All optional. |
-| `--result`, `--next-action-reason` | As described in step 3. Required. |
 
 The **Output** link does not contain the *configured* DIUs, parallel copies,
 and write batch size, so those are recorded as "not recorded" and the record
@@ -355,10 +365,7 @@ python .\scripts\collect_run_metrics.py stop `
     --subscription-id 00000000-0000-0000-0000-000000000000 `
     --resource-group rg-data-dev `
     --factory adf-data-dev `
-    --pipeline-run-id 11111111-2222-3333-4444-555555555555 `
-    --change "DIU 4 -> 8" `
-    --result PASS `
-    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
+    --pipeline-run-id 11111111-2222-3333-4444-555555555555
 ```
 
 | Parameter | What to put in it |
@@ -366,11 +373,44 @@ python .\scripts\collect_run_metrics.py stop `
 | `--test-id` | The same test ID you gave `start`. |
 | `--subscription-id`, `--resource-group`, `--factory` | As described in step 3. |
 | `--pipeline-run-id` | The run's ID: ADF Studio, **Monitor**, **Pipeline runs**, **Run ID** column. |
-| `--change`, `--result`, `--next-action-reason`, and the other notes | As described in step 3. |
 
 **From a saved file,** using the same command as in
 [Finish from a file saved in ADF Studio](#finish-from-a-file-saved-in-adf-studio),
 part 3. If the collector can't reach Azure at all, this is the way to use.
+
+Either way, it then asks the
+[three questions](#when-the-pipeline-finishes) and writes the record.
+
+### Run with nobody there to answer
+
+Use this only when `stop` runs with no window to type in, for example from a
+scheduled job. There is nobody to ask, so give the answers on the command
+line. Add them to whichever `stop` command you use:
+
+```powershell
+    --correctness "row counts match" `
+    --result PASS `
+    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
+```
+
+| Parameter | What to put in it |
+| --- | --- |
+| `--correctness` | Optional. The same as the first question in [When the pipeline finishes](#when-the-pipeline-finishes). |
+| `--result` | Required here. `PASS`, `FAIL`, or `INVESTIGATE`. |
+| `--next-action-reason` | Required here. One sentence on what to do next, and why. Put it in quotes. |
+
+Without a window, `stop` refuses to start unless `--result` and
+`--next-action-reason` are given, so a test can't be measured and then fail
+for lack of an answer. With `--snapshot-only` neither is needed, because that
+writes no record.
+
+Because you are deciding before the load has run, check the record afterwards.
+If your verdict no longer fits, run the same `stop` command again with the
+right answers and `--force`. It reuses the measurement already taken and
+rewrites only the record.
+
+`stop` also accepts `--change` and `--target-table-design`. Use them only to
+correct what you gave `start`; a value given to `stop` replaces it.
 
 ## What is written
 
@@ -463,7 +503,10 @@ be checked and changed without reading the code first.
 8. **Extracts the benchmark values** from the result, using the property
    names in Microsoft's "Monitor copy activity" documentation. Any value the
    result does not contain is recorded as "not recorded", never estimated.
-9. **Asks for the verdict and reason** if they were not on the command line.
+9. **Asks three questions** (correctness, verdict, and reason) for any answer
+   not on the command line. The measurement is saved before the first one, so
+   how long you take doesn't matter. The test's description comes from
+   `start`, unless `stop` was given a replacement.
 10. **Builds the record**, adds its warnings, and writes
     `benchmark_record.json` and `benchmark_record.md`.
 11. **Rebuilds `benchmark_index.csv`** from every record in the output
@@ -670,7 +713,7 @@ Besides the SQL warnings above, the record warns when:
 | Configured and actual DIUs | Activity input `dataIntegrationUnits`; output `usedDataIntegrationUnits` |
 | Parallel copies and connections | Input `parallelCopies`; output `usedParallelCopies` and the peak connection counts |
 | Write batch size | Activity input, sink `writeBatchSize` |
-| Target table design | `--target-table-design` (only the tester knows this) |
+| Target table design | `--target-table-design` on `start` (only the tester knows this) |
 | Copy duration and throughput | Output `copyDuration`; throughput is `dataRead` divided by `copyDuration`, in MiB/s |
 | Rows copied and rejected | Output `rowsCopied` and `rowsSkipped` |
 | Pre and post log usage | `sys.dm_db_log_space_usage` in each snapshot |
@@ -679,9 +722,10 @@ Besides the SQL warnings above, the record warns when:
 | Data-file IOPS and latency | Data file I/O counters, after minus before |
 | Lock waits | Sum of `LCK_M_X`, `LCK_M_IX`, and `LCK_M_SCH_M` wait deltas |
 | Cost per load and per GiB | `--cost-per-load`; cost per GiB is calculated |
-| Correctness result | `--correctness`, plus an automatic check that rows read equal rows copied |
-| PASS / FAIL / INVESTIGATE | `--result` |
-| Reason for the next action | `--next-action-reason` |
+| Correctness result | The tester's answer when `stop` asks, plus an automatic check that rows read equal rows copied |
+| PASS / FAIL / INVESTIGATE | The tester's answer when `stop` asks (or `--result`) |
+| Reason for the next action | The tester's answer when `stop` asks (or `--next-action-reason`) |
+| Change under test | `--change` on `start` |
 
 ### How the SQL numbers are calculated
 
@@ -801,6 +845,7 @@ first use, check one record by hand:
 
 | Message | Cause | Fix |
 | --- | --- | --- |
+| `--result and --next-action-reason are required when no terminal is available` | `stop` ran with no window to ask in, for example from a scheduled job | Give both on the command line; see [Run with nobody there to answer](#run-with-nobody-there-to-answer) |
 | `--server and --database are required` | `start` was run without a sink | Supply both, or use `--no-sql` |
 | `already has a 'before' snapshot` | The test ID was used before | Choose a new test ID, or pass `--force` |
 | `No 'before' snapshot found` | `stop` was run without `start`, or with a different `--output-dir` | Run `start` first; use the same `--output-dir` for both |

@@ -1449,6 +1449,19 @@ def _ask(value: str | None, question: str, choices: Sequence[str] | None = None)
         return answer.upper() if choices else answer
 
 
+def _ask_optional(value: str | None, question: str) -> str | None:
+    """Return ``value``, or ask for an optional answer that may be left blank.
+
+    With no terminal there is nobody to ask, so a missing value stays None.
+    """
+    if value:
+        return value
+    if not sys.stdin.isatty():
+        return None
+    answer = input(f"{question} (optional; press Enter to skip): ").strip()
+    return answer or None
+
+
 def command_start(args: argparse.Namespace) -> int:
     """Take the 'before' snapshot and open the test."""
     test_dir = _test_dir(args)
@@ -1477,6 +1490,9 @@ def command_start(args: argparse.Namespace) -> int:
         # What the tester states about a Managed Instance sink. Used only when
         # the sink turns out to be a Managed Instance; see mi_capacity.py.
         "managed_instance_stated": {"gp_storage": args.mi_gp_storage, "iops": args.mi_iops},
+        # What the tester knows before the load: what is being tested. The
+        # verdict comes later, from 'stop', once the result is known.
+        "description": {"change": args.change, "target_table_design": args.target_table_design},
     }
 
     if args.no_sql:
@@ -1712,11 +1728,20 @@ def command_stop(args: argparse.Namespace) -> int:
     copy = summarise_copy_activity(payload)
 
     # 4. Build and write the record.
+    #    The test's description is given on 'start', before the load. A value
+    #    given on 'stop' replaces it, so a mistake can be corrected.
+    #    The judgement is asked for here, after the load, because only now can
+    #    it be known. The measurement is already saved, so an answer given
+    #    hours later changes nothing that was measured.
+    description = session.get("description") or {}
+    if sys.stdin.isatty() and not (args.result and args.next_action_reason):
+        print(f"\nPipeline finished and measured for test {session['test_id']}. "
+              "Answer the questions below to finish the record.")
     notes = {
-        "change_under_test": args.change,
-        "target_table_design": args.target_table_design,
+        "change_under_test": args.change or description.get("change"),
+        "target_table_design": args.target_table_design or description.get("target_table_design"),
         "cost_per_load": args.cost_per_load,
-        "correctness": args.correctness,
+        "correctness": _ask_optional(args.correctness, "Did the data arrive correctly? For example 'row counts match'"),
         # The verdict and the reason for the next action are required because
         # the runbook treats them as the point of the record: they stop tuning
         # from becoming a sequence of unexplained setting changes.
@@ -1808,6 +1833,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Trust the presented server certificate; controlled development use only")
     start.add_argument("--no-sql", action="store_true",
                        help="Do not collect SQL measurements (use when the sink is not a SQL database)")
+    described = start.add_argument_group("what is being tested (optional, recorded with the test)")
+    described.add_argument("--change", help="What is different about this test, for example 'DIU 4 -> 8' or 'baseline'")
+    described.add_argument("--target-table-design",
+                           help="How the sink table is built, for example 'heap, no indexes'")
     mi = start.add_argument_group("Azure SQL Managed Instance sinks only (ignored on other platforms)")
     mi.add_argument("--mi-gp-storage", choices=mi_capacity.GP_STORAGE_CHOICES,
                     help="General Purpose storage type of the instance; needed to judge storage limits")
@@ -1837,13 +1866,14 @@ def build_parser() -> argparse.ArgumentParser:
                          help=f"Stop waiting after this many hours (default {DEFAULT_TIMEOUT_HOURS:g})")
     waiting.add_argument("--snapshot-only", action="store_true",
                          help="Stop after the 'after' snapshot; finish later with --adf-output-file")
-    notes = stop.add_argument_group("what the tester knows")
-    notes.add_argument("--change", help="What was changed for this test, for example 'DIU 4 -> 8'")
-    notes.add_argument("--target-table-design", help="For example 'heap, no indexes' or 'clustered index + 2 nonclustered'")
-    notes.add_argument("--cost-per-load", type=float, help="Cost of this load, when known")
+    notes = stop.add_argument_group(
+        "the tester's judgement (asked for when the pipeline finishes; give them here only for unattended runs)")
     notes.add_argument("--correctness", help="Correctness result, for example 'row counts and checksums match'")
     notes.add_argument("--result", choices=RESULT_CHOICES, help="Verdict for this test (asked for if omitted)")
     notes.add_argument("--next-action-reason", help="Why the evidence leads to the next test or action (asked for if omitted)")
+    notes.add_argument("--cost-per-load", type=float, help="Cost of this load, when known")
+    notes.add_argument("--change", help="Replaces the --change given on 'start'")
+    notes.add_argument("--target-table-design", help="Replaces the --target-table-design given on 'start'")
     stop.add_argument("--force", action="store_true", help="Replace an existing benchmark record for this test ID")
     stop.set_defaults(handler=command_stop)
 

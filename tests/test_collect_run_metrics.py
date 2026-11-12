@@ -449,8 +449,17 @@ class BenchmarkRecordTests(unittest.TestCase):
         self.assertIn("| Actual DIUs | 8 |", markdown)
 
 
+def read_record(out, test_id):
+    return json.loads((out / test_id / "benchmark_record.json").read_text(encoding="utf-8"))
+
+
 class CommandLineTests(unittest.TestCase):
     """Run the commands end to end, the way an operator would."""
+
+    def setUp(self):
+        stdin = patch.object(c.sys, "stdin", io.StringIO())
+        stdin.start()
+        self.addCleanup(stdin.stop)
 
     def run_main(self, *argv):
         captured = io.StringIO()
@@ -462,6 +471,63 @@ class CommandLineTests(unittest.TestCase):
         return ["stop", "--test-id", test_id, "--output-dir", str(out), "--adf-output-file", str(adf_file),
                 "--change", "DIU 4 -> 8", "--target-table-design", "heap", "--correctness", "row counts match",
                 "--result", "PASS", "--next-action-reason", "Faster with a healthy sink; try 16 next."]
+
+    def test_description_given_on_start_reaches_the_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            adf_file = Path(td) / "activity.json"
+            adf_file.write_text(json.dumps(ACTIVITY_RUN), encoding="utf-8")
+            code, _ = self.run_main("start", "--test-id", "T01", "--output-dir", str(out), "--no-sql",
+                                    "--change", "DIU 4 -> 8", "--target-table-design", "heap")
+            self.assertEqual(code, 0)
+            code, printed = self.run_main("stop", "--test-id", "T01", "--output-dir", str(out),
+                                          "--adf-output-file", str(adf_file), "--result", "PASS",
+                                          "--next-action-reason", "Try 16 next.")
+            self.assertEqual(code, 0, printed)
+            record = read_record(out, "T01")
+            self.assertEqual(record["outcome"]["change_under_test"], "DIU 4 -> 8")
+            self.assertEqual(record["settings"]["target_table_design"], "heap")
+
+    def test_description_on_stop_replaces_the_one_from_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            adf_file = Path(td) / "activity.json"
+            adf_file.write_text(json.dumps(ACTIVITY_RUN), encoding="utf-8")
+            self.run_main("start", "--test-id", "T01", "--output-dir", str(out), "--no-sql", "--change", "typo")
+            argv = self.stop_args(out, adf_file)  # carries --change "DIU 4 -> 8"
+            code, printed = self.run_main(*argv)
+            self.assertEqual(code, 0, printed)
+            self.assertEqual(read_record(out, "T01")["outcome"]["change_under_test"], "DIU 4 -> 8")
+
+    def test_verdict_can_be_corrected_with_force(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            adf_file = Path(td) / "activity.json"
+            adf_file.write_text(json.dumps(ACTIVITY_RUN), encoding="utf-8")
+            self.run_main("start", "--test-id", "T01", "--output-dir", str(out), "--no-sql")
+            self.assertEqual(self.run_main(*self.stop_args(out, adf_file))[0], 0)
+            argv = self.stop_args(out, adf_file)
+            argv[argv.index("PASS")] = "FAIL"
+            self.assertEqual(self.run_main(*argv)[0], 2)  # refuses without --force
+            self.assertEqual(self.run_main(*argv, "--force")[0], 0)
+            self.assertEqual(read_record(out, "T01")["outcome"]["result"], "FAIL")
+
+    def test_judgement_is_asked_for_after_the_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            adf_file = Path(td) / "activity.json"
+            adf_file.write_text(json.dumps(ACTIVITY_RUN), encoding="utf-8")
+            self.run_main("start", "--test-id", "T01", "--output-dir", str(out), "--no-sql")
+            answers = iter(["row counts match", "investigate", "Throughput fell; check log waits."])
+            with patch.object(c.sys, "stdin", **{"isatty.return_value": True}), \
+                    patch("builtins.input", side_effect=lambda _prompt: next(answers)):
+                code, printed = self.run_main("stop", "--test-id", "T01", "--output-dir", str(out),
+                                              "--adf-output-file", str(adf_file))
+            self.assertEqual(code, 0, printed)
+            self.assertIn("Answer the questions below", printed)
+            record = read_record(out, "T01")
+            self.assertEqual(record["correctness"]["tester_result"], "row counts match")
+            self.assertEqual(record["outcome"]["result"], "INVESTIGATE")
 
     def test_full_flow_without_sql(self):
         with tempfile.TemporaryDirectory() as td:
@@ -788,6 +854,11 @@ class StopWaitCommandTests(unittest.TestCase):
 
     AZURE = ["--subscription-id", "sub", "--resource-group", "rg", "--factory", "adf"]
     VERDICT = ["--result", "PASS", "--next-action-reason", "Baseline recorded."]
+
+    def setUp(self):
+        stdin = patch.object(c.sys, "stdin", io.StringIO())
+        stdin.start()
+        self.addCleanup(stdin.stop)
 
     def run_main(self, *argv):
         captured = io.StringIO()
