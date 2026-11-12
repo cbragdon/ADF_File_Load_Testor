@@ -10,32 +10,6 @@ These scripts are intended for the ADF Performance Toolkit learning lab and for 
 
 > **Important:** SQL MI user databases use the FULL recovery model. Treat transaction-log behavior as part of the workload to measure and tune. Do not base the test plan on switching to SIMPLE or BULK_LOGGED recovery.
 
-## File diagnostic v2-4 (pending MI testing)
-
-Run `azure_sql_mi_file_diagnostic_v2-4.sql` in SSMS to test the per-file log
-space correction. Version v2-3 is retained unchanged.
-
-In the first result set, `Space_Used_Inside_File_GB` and
-`Free_Space_Inside_File_GB` apply only to data files. Log rows instead show
-`Log_Active_VLF_Capacity_GB` and `Log_Inactive_VLF_Capacity_GB`, summed from
-`sys.dm_db_log_info(DB_ID())` separately for each file. These are VLF
-capacities, not exact occupied bytes: active VLFs can contain unused space,
-and inactive VLF capacity is reusable log capacity, not free disk space.
-File headers and DMV rounding can make their sum differ from file size.
-The existing `_GB` column suffix represents GiB (division by 1024).
-
-`Space_Measurement_Basis` identifies the measurement or reports `UNAVAILABLE`.
-On current MI versions, the VLF function requires
-`VIEW DATABASE PERFORMANCE STATE` in each database. If the VLF query fails,
-the script prints the error in **Messages**, leaves those metrics `NULL`,
-and retains the database's other file measurements.
-
-For your MI test, compare each log file's two capacity columns with the sums
-of `vlf_size_mb / 1024.0` for that file's active and inactive VLFs in
-`sys.dm_db_log_info(DB_ID())`. Do not expect every log file to have the same
-active percentage, or expect active VLF capacity to equal the database-wide
-used bytes reported by `sys.dm_db_log_space_usage`.
-
 ## Recommended test workflow
 
 `scripts\collect_run_metrics.py` automates the before-and-after captures of
