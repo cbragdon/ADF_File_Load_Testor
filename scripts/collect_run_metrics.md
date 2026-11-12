@@ -144,6 +144,16 @@ under [Verification status](#verification-status).
 Run the commands from the repository root. Each test runs `start` once and
 `stop` once.
 
+The examples below use made-up values. Under each command is a table that
+says what to put in each parameter and where to find it. Replace every example
+value with your own before you run the command.
+
+The examples are split over several lines to make them readable. In
+PowerShell, the backtick (`` ` ``) at the end of a line means "the command
+continues on the next line". Keep the backticks, and make sure nothing follows
+them on the line, not even a space. You can also type the whole command on one
+line without them.
+
 ### 1. Run `start` to take the "before" snapshot
 
 Do this immediately before you start the pipeline.
@@ -151,16 +161,26 @@ Do this immediately before you start the pipeline.
 ```powershell
 python .\scripts\collect_run_metrics.py start `
     --test-id DIU-08-run1 `
+    --environment sandbox `
     --server sqlmi-dev.example.database.windows.net `
     --database LoadTest `
     --auth entra-default
 ```
 
+| Parameter | What to put in it | Where to find it |
+| --- | --- | --- |
+| `--test-id` | A short name you choose for this test. Use a new one for every test, and the same one again in `stop`. Letters, digits, `.`, `_`, and `-` only, up to 64 characters. | You make it up. A name that says what changed works well, for example `DIU-08-run1` for the first run at 8 DIUs. |
+| `--environment` | A label for where the test runs, for example `sandbox` or `dev`. It is stored in the record so you can tell runs apart later. Optional; the default is `dev`. | You choose it. |
+| `--server` | The SQL server the pipeline loads into (the sink). | **SQL Managed Instance:** Azure portal, open the managed instance, **Overview**, **Host**. **Azure SQL Database:** Azure portal, open the database, **Overview**, **Server name**. **SQL Server on a VM:** the VM's host name or DNS name. Add `,port` at the end if SQL Server doesn't listen on 1433, for example `sqlvm01.contoso.local,14330`. |
+| `--database` | The name of the database the pipeline loads into. | The sink dataset or linked service in ADF Studio, or the database list in SSMS. |
+| `--auth` | How you sign in to SQL. `entra-default` uses your existing Azure sign-in with no prompt. `entra-interactive` opens a browser sign-in. `windows` uses your Windows sign-in. The default is `windows`. | Use `entra-default` or `entra-interactive` for Managed Instance and Azure SQL Database. Use `windows` for a SQL Server VM joined to your domain. |
+
+Only `--test-id` is always needed. `--server` and `--database` are needed
+unless you add `--no-sql`, which skips SQL measurements. Use that only when
+the sink isn't a SQL database.
+
 The script prints where the "before" snapshot was saved. Go straight on to
 step 2.
-
-`--auth` accepts `windows` (default), `entra-default`, or `entra-interactive`,
-exactly as the file generator does.
 
 ### 2. Start the ADF pipeline
 
@@ -189,13 +209,37 @@ python .\scripts\collect_run_metrics.py stop `
     --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
 ```
 
-While it waits, it prints each status change (Queued, InProgress, then
-Succeeded) and a short "still waiting" line every ten minutes.
+| Parameter | What to put in it | Where to find it |
+| --- | --- | --- |
+| `--test-id` | The same test ID you gave `start`. | Your `start` command. |
+| `--wait` | Type it as shown. It tells `stop` to wait for the pipeline. | |
+| `--pipeline-name` | The name of the pipeline you started in step 2. Type it exactly as ADF Studio shows it. | ADF Studio, **Author**, **Pipelines**. |
+| `--subscription-id` | The ID of the Azure subscription that holds the data factory. It looks like `00000000-0000-0000-0000-000000000000`. | Azure portal, open the data factory, **Overview**, **Subscription ID**. If your Azure CLI is already set to that subscription, `az account show --query id` prints it too. |
+| `--resource-group` | The resource group the data factory is in. | Azure portal, open the data factory, **Overview**, **Resource group**. |
+| `--factory` | The data factory's name. | Azure portal, the name at the top of the data factory's page. ADF Studio also shows it at the top of the screen. |
+| `--change` | What is different about this test, in a few words, for example `DIU 4 -> 8` or `baseline`. Optional, but it makes tests easy to compare later. | You describe it. |
+| `--target-table-design` | How the sink table is built, for example `heap, no indexes` or `clustered index + 2 nonclustered`. Optional. | The table's definition in SSMS. |
+| `--correctness` | Whether the data arrived correctly, for example `row counts match`. Optional. | Your own check after the load. |
+| `--result` | Your verdict: `PASS`, `FAIL`, or `INVESTIGATE`. | You decide. |
+| `--next-action-reason` | One sentence on what this result tells you to do next, and why. Put it in quotes. | You decide. |
 
 `--result` and `--next-action-reason` are required. If you leave them out, the
-script asks for them once the pipeline has finished. The runbook treats the
-reason for the next action as the point of the record: it stops tuning from
-becoming a sequence of unexplained setting changes.
+script asks for them once the pipeline has finished, so you can decide after
+you have seen the run. The runbook treats the reason for the next action as the
+point of the record: it stops tuning from becoming a sequence of unexplained
+setting changes.
+
+Optional parameters for waiting:
+
+| Parameter | What it does | Default |
+| --- | --- | --- |
+| `--pipeline-run-id` | Follows one specific run instead of finding it by `--pipeline-name`. The ID is in ADF Studio, **Monitor**, **Pipeline runs**, **Run ID** column. | Not used |
+| `--poll-seconds` | How often, in seconds, it checks the run's status. The lowest allowed is 10. | 30 |
+| `--timeout-hours` | How long it waits before giving up. Raise it for loads that may run longer. | 12 |
+| `--activity-name` | The Copy activity to record, when the pipeline has more than one. Use the activity's name as shown in the pipeline in ADF Studio. | Not used |
+
+While it waits, it prints each status change (Queued, InProgress, then
+Succeeded) and a short "still waiting" line every ten minutes.
 
 Things to know:
 
@@ -237,9 +281,11 @@ from Azure. `stop` then runs in two parts, and the snapshot is still taken only
 once.
 
 1. **Wait and take the snapshot.** Run step 3's command with
-   `--snapshot-only` added. You can leave out `--result`,
-   `--next-action-reason`, and the other notes for now. It waits for the
-   pipeline, takes the "after" snapshot when it finishes, and stops.
+   `--snapshot-only` added. Fill in `--test-id`, `--pipeline-name`,
+   `--subscription-id`, `--resource-group`, and `--factory` as described in
+   step 3. You can leave out `--result`, `--next-action-reason`, and the other
+   notes for now. It waits for the pipeline, takes the "after" snapshot when it
+   finishes, and stops.
 2. **Save the Copy activity result.** In ADF Studio, open the pipeline run on
    the Monitor tab, select the Copy activity's **Output** link, and save the
    JSON to a file.
@@ -254,6 +300,13 @@ python .\scripts\collect_run_metrics.py stop `
     --result PASS `
     --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
 ```
+
+| Parameter | What to put in it |
+| --- | --- |
+| `--test-id` | The same test ID you gave `start`. |
+| `--adf-output-file` | The path to the file you saved in part 2. A path starting with `.\` is relative to the repository root. Put the path in quotes if it contains spaces. |
+| `--change`, `--target-table-design`, `--correctness` | As described in step 3. All optional. |
+| `--result`, `--next-action-reason` | As described in step 3. Required. |
 
 The **Output** link does not contain the *configured* DIUs, parallel copies,
 and write batch size, so those are recorded as "not recorded" and the record
@@ -288,6 +341,13 @@ python .\scripts\collect_run_metrics.py stop `
     --result PASS `
     --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
 ```
+
+| Parameter | What to put in it |
+| --- | --- |
+| `--test-id` | The same test ID you gave `start`. |
+| `--subscription-id`, `--resource-group`, `--factory` | As described in step 3. |
+| `--pipeline-run-id` | The run's ID: ADF Studio, **Monitor**, **Pipeline runs**, **Run ID** column. |
+| `--change`, `--result`, `--next-action-reason`, and the other notes | As described in step 3. |
 
 **From a saved file,** using the same command as in
 [Finish from a file saved in ADF Studio](#finish-from-a-file-saved-in-adf-studio),
