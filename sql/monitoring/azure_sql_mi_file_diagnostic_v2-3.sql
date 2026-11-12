@@ -119,10 +119,16 @@ INSERT #MI_File_Stats
 SELECT
     DB_ID(), file_id, DB_NAME(), name, type_desc,
     CAST(size * 8.0 / 1024.0 / 1024.0 AS decimal(12,2)),
-    CASE WHEN type_desc = ''ROWS''
-         THEN CAST(FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024.0 / 1024.0 AS decimal(12,2)) END,
-    CASE WHEN type_desc = ''ROWS''
-         THEN CAST((size - FILEPROPERTY(name, ''SpaceUsed'')) * 8.0 / 1024.0 / 1024.0 AS decimal(12,2)) END
+    CAST(
+        CASE WHEN type_desc = ''LOG''
+             THEN ISNULL((SELECT used_log_space_in_bytes * 1.0 / NULLIF(total_log_size_in_bytes,0) FROM sys.dm_db_log_space_usage) * size, 0)
+             ELSE ISNULL(FILEPROPERTY(name, ''SpaceUsed''), 0) END
+        * 8.0 / 1024.0 / 1024.0 AS decimal(12,2)),
+    CAST(
+        (size - CASE WHEN type_desc = ''LOG''
+                     THEN ISNULL((SELECT used_log_space_in_bytes * 1.0 / NULLIF(total_log_size_in_bytes,0) FROM sys.dm_db_log_space_usage) * size, 0)
+                     ELSE ISNULL(FILEPROPERTY(name, ''SpaceUsed''), 0) END)
+        * 8.0 / 1024.0 / 1024.0 AS decimal(12,2))
 FROM sys.database_files;';
 
     BEGIN TRY
@@ -215,9 +221,9 @@ SELECT
     CAST((Reads_Delta + Writes_Delta) / NULLIF(Sample_Seconds,0) AS decimal(19,2)),
     CAST(Bytes_Read_Delta / 1048576.0 / NULLIF(Sample_Seconds,0) AS decimal(19,2)),
     CAST(Bytes_Written_Delta / 1048576.0 / NULLIF(Sample_Seconds,0) AS decimal(19,2)),
-    CAST(Read_Stall_Delta_MS * 1.0 / NULLIF(Reads_Delta,0) AS decimal(19,2)),
-    CAST(Write_Stall_Delta_MS * 1.0 / NULLIF(Writes_Delta,0) AS decimal(19,2)),
-    CAST(IO_Stall_Delta_MS * 1.0 / NULLIF(Reads_Delta + Writes_Delta,0) AS decimal(19,2))
+    CAST(ISNULL(Read_Stall_Delta_MS * 1.0 / NULLIF(Reads_Delta,0),0) AS decimal(19,2)),
+    CAST(ISNULL(Write_Stall_Delta_MS * 1.0 / NULLIF(Writes_Delta,0),0) AS decimal(19,2)),
+    CAST(ISNULL(IO_Stall_Delta_MS * 1.0 / NULLIF(Reads_Delta + Writes_Delta,0),0) AS decimal(19,2))
 FROM DeltaSource;
 
 DECLARE @CombinedLiveInstanceIOPS decimal(19,2) =
@@ -346,41 +352,9 @@ SELECT
     END AS Merged_Recommendation
 FROM #FileAnalysis
 CROSS JOIN #Instance_Config AS ic
-ORDER BY CASE WHEN DatabaseID=@TargetDatabaseID THEN 1 WHEN DatabaseName='tempdb' THEN 2 WHEN DatabaseID>4 THEN 3 ELSE 4 END,
-         DatabaseName, FileType, LogicalName;
+ORDER BY DatabaseName, FileType DESC, LogicalName;
 
-/* RESULT SET 2: DATABASE ACTIVITY BREAKDOWN */
-;WITH DatabaseActivity AS
-(
-    SELECT
-        DatabaseID, DatabaseName,
-        CASE WHEN DatabaseID=@TargetDatabaseID THEN 1
-             WHEN DatabaseName='tempdb' THEN 2
-             WHEN DatabaseID>4 THEN 3 ELSE 4 END AS DisplayOrder,
-        CASE WHEN DatabaseID<=4 THEN 1 ELSE 0 END AS IsSystemDatabase,
-        SUM(Read_IOPS) AS Read_IOPS,
-        SUM(Write_IOPS) AS Write_IOPS,
-        SUM(Live_File_IOPS) AS Total_IOPS,
-        SUM(Live_Read_MiBps) AS Read_MiBps,
-        SUM(Live_Write_MiBps) AS Write_MiBps,
-        SUM(CASE WHEN FileType='LOG' THEN Live_Write_MiBps ELSE 0 END) AS Log_Write_MiBps
-    FROM #FileAnalysis
-    GROUP BY DatabaseID, DatabaseName
-)
-SELECT
-    DatabaseName,
-    CAST(Read_IOPS AS decimal(19,2)) AS Read_IOPS,
-    CAST(Write_IOPS AS decimal(19,2)) AS Write_IOPS,
-    CAST(Total_IOPS AS decimal(19,2)) AS Total_IOPS,
-    CAST(Read_MiBps AS decimal(19,2)) AS Read_MiBps,
-    CAST(Write_MiBps AS decimal(19,2)) AS Write_MiBps,
-    CAST(Log_Write_MiBps AS decimal(19,2)) AS Log_Write_MiBps,
-    CAST(100.0*Total_IOPS/NULLIF(@CombinedLiveInstanceIOPS,0) AS decimal(9,2)) AS Percent_Of_Observed_Instance_IOPS
-FROM DatabaseActivity
-WHERE IsSystemDatabase=0 OR Total_IOPS>0
-ORDER BY DisplayOrder, Total_IOPS DESC;
-
-/* RESULT SET 3: INSTANCE CAPACITY AND OVERLOAD DIAGNOSIS - ENHANCED v2-2 */
+/* RESULT SET 2: INSTANCE CAPACITY AND OVERLOAD DIAGNOSIS - ENHANCED v2-2 */
 SELECT
     ic.ServiceTier AS Service_Tier,
     ic.vCores AS Allocated_vCores,
@@ -423,8 +397,38 @@ SELECT
                      AND (Live_Avg_Read_Latency_MS>15 OR Live_Avg_Write_Latency_MS>15)) THEN
             'Instance has headroom but one or more files show high latency near their estimated file ceiling. Evaluate file-level remediation.'
         ELSE 'This sample does not prove a file-size or instance-capacity constraint. Correlate with waits and repeat during sustained load.'
-    END AS Evidence_Based_Next_Action,
+    END AS Evidence_Based_Next_Action
 FROM #Instance_Config AS ic;
+
+/* RESULT SET 3: DATABASE ACTIVITY BREAKDOWN */
+;WITH DatabaseActivity AS
+(
+    SELECT
+        DatabaseID, DatabaseName,
+        CASE WHEN DatabaseID=@TargetDatabaseID THEN 1
+             WHEN DatabaseName='tempdb' THEN 2
+             WHEN DatabaseID>4 THEN 3 ELSE 4 END AS DisplayOrder,
+        CASE WHEN DatabaseID<=4 THEN 1 ELSE 0 END AS IsSystemDatabase,
+        SUM(Read_IOPS) AS Read_IOPS,
+        SUM(Write_IOPS) AS Write_IOPS,
+        SUM(Live_File_IOPS) AS Total_IOPS,
+        SUM(Live_Read_MiBps) AS Read_MiBps,
+        SUM(Live_Write_MiBps) AS Write_MiBps,
+        SUM(CASE WHEN FileType='LOG' THEN Live_Write_MiBps ELSE 0 END) AS Log_Write_MiBps
+    FROM #FileAnalysis
+    GROUP BY DatabaseID, DatabaseName
+)
+SELECT
+    DatabaseName,
+    CAST(Read_IOPS AS decimal(19,2)) AS Read_IOPS,
+    CAST(Write_IOPS AS decimal(19,2)) AS Write_IOPS,
+    CAST(Total_IOPS AS decimal(19,2)) AS Total_IOPS,
+    CAST(Read_MiBps AS decimal(19,2)) AS Read_MiBps,
+    CAST(Write_MiBps AS decimal(19,2)) AS Write_MiBps,
+    CAST(Log_Write_MiBps AS decimal(19,2)) AS Log_Write_MiBps,
+    CAST(ISNULL(100.0*Total_IOPS/NULLIF(@CombinedLiveInstanceIOPS,0),0) AS decimal(9,2)) AS Percent_Of_Observed_Instance_IOPS
+FROM DatabaseActivity
+ORDER BY Total_IOPS DESC;
 
 DROP TABLE #FileAnalysis;
 DROP TABLE #FileDeltas;
