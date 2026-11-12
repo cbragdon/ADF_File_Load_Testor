@@ -12,8 +12,9 @@ import logging
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -548,6 +549,350 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(self.run_main(*self.stop_args(out, adf_file))[0], 0)
             saved = json.loads((out / "T01" / "adf_activity.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["activityName"], "CopyOrders")
+
+
+# ---------------------------------------------------------------------------
+# Waiting for the pipeline run to finish ('stop --wait')
+# ---------------------------------------------------------------------------
+
+def pipeline_run(status, run_id="run-1", started=None, ended=None, name="PL_Test"):
+    """A pipeline run in the shape the ADF API returns."""
+    started = started or c.utc_now()
+    return {
+        "runId": run_id,
+        "pipelineName": name,
+        "status": status,
+        "runStart": c.to_iso(started),
+        "runEnd": c.to_iso(ended) if ended else None,
+        "durationInMs": 90000 if ended else None,
+        "message": "" if status == "Succeeded" else f"Run {status}",
+    }
+
+
+class FakeClock:
+    """A clock that moves forward only when the code under test sleeps."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class AdfTimeTests(unittest.TestCase):
+    def test_seven_fraction_digits_and_offsets_are_read(self):
+        self.assertEqual(c.parse_adf_time("2026-11-11T21:01:35.1234567Z"),
+                         datetime(2026, 11, 11, 21, 1, 35, 123456, tzinfo=timezone.utc))
+        self.assertEqual(c.parse_adf_time("2026-11-11T16:01:35-05:00"),
+                         datetime(2026, 11, 11, 21, 1, 35, tzinfo=timezone.utc))
+        self.assertIsNone(c.parse_adf_time(None))
+        self.assertIsNone(c.parse_adf_time("not a time"))
+
+
+class ChoosePipelineRunTests(unittest.TestCase):
+    def setUp(self):
+        self.started_at = datetime(2026, 11, 11, 21, 0, tzinfo=timezone.utc)
+
+    def test_runs_started_before_start_are_ignored(self):
+        old = pipeline_run("Succeeded", "old", started=self.started_at - timedelta(hours=1))
+        new = pipeline_run("InProgress", "new", started=self.started_at + timedelta(seconds=20))
+        self.assertIs(c.choose_pipeline_run([old, new], self.started_at), new)
+
+    def test_small_clock_difference_is_tolerated(self):
+        slightly_early = pipeline_run("InProgress", started=self.started_at - timedelta(seconds=60))
+        self.assertIs(c.choose_pipeline_run([slightly_early], self.started_at), slightly_early)
+
+    def test_no_run_yet_returns_none(self):
+        self.assertIsNone(c.choose_pipeline_run([], self.started_at))
+
+    def test_two_runs_after_start_need_a_run_id(self):
+        runs = [pipeline_run("InProgress", "a", started=self.started_at + timedelta(seconds=5)),
+                pipeline_run("InProgress", "b", started=self.started_at + timedelta(seconds=9))]
+        with self.assertRaises(c.AzureCallError) as raised:
+            c.choose_pipeline_run(runs, self.started_at)
+        self.assertFalse(raised.exception.retryable)
+        self.assertIn("--pipeline-run-id", str(raised.exception))
+
+
+class WaitLoopTests(unittest.TestCase):
+    def wait(self, results, timeout=3600):
+        """Run the wait loop against a scripted list of check results."""
+        clock = FakeClock()
+        script = list(results)
+
+        def check():
+            item = script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        run = c.wait_for_pipeline_run(check, 30, timeout, sleep=clock.sleep, clock=clock.time)
+        return run, clock
+
+    def test_waits_through_queued_and_in_progress(self):
+        final = pipeline_run("Succeeded")
+        run, clock = self.wait([pipeline_run("Queued"), pipeline_run("InProgress"), final])
+        self.assertIs(run, final)
+        self.assertEqual(clock.sleeps, [30, 30])
+
+    def test_waits_for_the_run_to_appear(self):
+        final = pipeline_run("Succeeded")
+        run, clock = self.wait([None, None, final])
+        self.assertIs(run, final)
+        self.assertEqual(len(clock.sleeps), 2)
+
+    def test_failed_and_cancelled_also_end_the_wait(self):
+        for status in ("Failed", "Cancelled"):
+            run, _ = self.wait([pipeline_run(status)])
+            self.assertEqual(run["status"], status)
+
+    def test_canceling_is_not_final(self):
+        run, clock = self.wait([pipeline_run("Canceling"), pipeline_run("Cancelled")])
+        self.assertEqual(run["status"], "Cancelled")
+        self.assertEqual(len(clock.sleeps), 1)
+
+    def test_timeout_stops_the_wait(self):
+        with self.assertRaises(TimeoutError):
+            self.wait([pipeline_run("InProgress")] * 10, timeout=100)
+
+    def test_passing_faults_are_retried(self):
+        fault = c.AzureCallError("throttled", retryable=True)
+        run, _ = self.wait([fault, fault, pipeline_run("Succeeded")])
+        self.assertEqual(run["status"], "Succeeded")
+
+    def test_too_many_faults_in_a_row_stop_the_wait(self):
+        fault = c.AzureCallError("unreachable", retryable=True)
+        with self.assertRaises(c.AzureCallError) as raised:
+            self.wait([fault] * c.MAX_CONSECUTIVE_CHECK_FAILURES)
+        self.assertIn("failed status checks in a row", str(raised.exception))
+
+    def test_lasting_faults_stop_at_once(self):
+        with self.assertRaises(c.AzureCallError):
+            _, clock = self.wait([c.AzureCallError("HTTP 403", retryable=False)])
+
+
+class PipelineApiTests(unittest.TestCase):
+    def test_runs_are_found_by_pipeline_name_with_paging(self):
+        pages = [{"value": [], "continuationToken": "next"}, {"value": [pipeline_run("InProgress")]}]
+        requests = []
+
+        def opener(request, timeout=None):
+            requests.append(request)
+            return FakeResponse(pages[len(requests) - 1])
+
+        runs = c.find_pipeline_runs("sub", "rg", "adf", "PL_Test",
+                                    datetime(2026, 11, 11, tzinfo=timezone.utc),
+                                    datetime(2026, 11, 12, tzinfo=timezone.utc), "tok", opener=opener)
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(requests[0].full_url.endswith("/factories/adf/queryPipelineRuns?api-version=2018-06-01"))
+        body = json.loads(requests[0].data)
+        self.assertEqual(body["filters"], [{"operand": "PipelineName", "operator": "Equals", "values": ["PL_Test"]}])
+        self.assertEqual(json.loads(requests[1].data)["continuationToken"], "next")
+
+    def test_one_run_is_read_by_id(self):
+        requests = []
+
+        def opener(request, timeout=None):
+            requests.append(request)
+            return FakeResponse(pipeline_run("InProgress", "run-9"))
+
+        run = c.get_pipeline_run("sub", "rg", "adf", "run-9", "tok", opener=opener)
+        self.assertEqual(run["runId"], "run-9")
+        self.assertEqual(requests[0].get_method(), "GET")
+        self.assertIn("/factories/adf/pipelineruns/run-9?api-version=2018-06-01", requests[0].full_url)
+
+    def test_throttling_is_retryable_but_not_found_is_not(self):
+        def failing(code):
+            def opener(request, timeout=None):
+                raise urllib.error.HTTPError(request.full_url, code, "error", {}, io.BytesIO(b"detail"))
+            return opener
+
+        with self.assertRaises(c.AzureCallError) as throttled:
+            c.get_pipeline_run("sub", "rg", "adf", "run-9", "tok", opener=failing(429))
+        self.assertTrue(throttled.exception.retryable)
+        with self.assertRaises(c.AzureCallError) as missing:
+            c.get_pipeline_run("sub", "rg", "adf", "run-9", "tok", opener=failing(404))
+        self.assertFalse(missing.exception.retryable)
+
+
+class WaitRecordTests(unittest.TestCase):
+    def test_unsuccessful_pipeline_and_long_lag_are_warned_about(self):
+        waited = {"status": "Failed", "snapshot_lag_seconds": 900, "poll_seconds": 30}
+        record = c.build_benchmark_record(TEST_IDENTITY, NOTES, c.summarise_copy_activity(ACTIVITY_RUN), None, waited)
+        text = " | ".join(record["warnings"])
+        self.assertIn("finished with status 'Failed'", text)
+        self.assertIn("Was the computer asleep?", text)
+
+    def test_normal_lag_is_not_warned_about(self):
+        waited = {"status": "Succeeded", "snapshot_lag_seconds": 25, "poll_seconds": 30}
+        record = c.build_benchmark_record(TEST_IDENTITY, NOTES, c.summarise_copy_activity(ACTIVITY_RUN), None, waited)
+        self.assertFalse(any("asleep" in warning for warning in record["warnings"]))
+
+
+class StopWaitCommandTests(unittest.TestCase):
+    """Run 'stop --wait' end to end with ADF and SQL replaced by fakes."""
+
+    AZURE = ["--subscription-id", "sub", "--resource-group", "rg", "--factory", "adf"]
+    VERDICT = ["--result", "PASS", "--next-action-reason", "Baseline recorded."]
+
+    def run_main(self, *argv):
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            code = c.main(list(argv))
+        return code, captured.getvalue()
+
+    def start(self, out, *extra):
+        code, _ = self.run_main("start", "--test-id", "W01", "--output-dir", str(out), *extra)
+        self.assertEqual(code, 0)
+
+    def test_wait_finds_the_run_by_name_and_finishes_with_option_a(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            self.start(out, "--no-sql")
+            ended = c.utc_now() + timedelta(minutes=5)
+            statuses = [pipeline_run("InProgress", "run-42"), pipeline_run("Succeeded", "run-42", ended=ended)]
+            with patch.object(c, "acquire_management_token", return_value="tok"), \
+                 patch.object(c, "find_pipeline_runs", side_effect=[[], [pipeline_run("Queued", "run-42")]]) as find, \
+                 patch.object(c, "get_pipeline_run", side_effect=statuses) as get, \
+                 patch.object(c, "query_activity_runs", return_value=[ACTIVITY_RUN]) as activities, \
+                 patch.object(c.time, "sleep") as sleep:
+                code, printed = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out), "--wait",
+                                              "--pipeline-name", "PL_Test", *self.AZURE, *self.VERDICT)
+            self.assertEqual(code, 0, printed)
+            # Two searches by name (not started, then found), then two reads by run ID.
+            self.assertEqual(find.call_count, 2)
+            self.assertEqual(get.call_count, 2)
+            self.assertEqual(get.call_args.args[3], "run-42")
+            self.assertEqual(sleep.call_count, 3)
+            self.assertEqual(activities.call_args.args[3], "run-42")
+            record = json.loads((out / "W01" / "benchmark_record.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["test"]["pipeline_run_id"], "run-42")
+            self.assertEqual(record["test"]["pipeline_status"], "Succeeded")
+            self.assertIsNone(record["test"]["snapshot_lag_seconds"], "no SQL snapshot, so no lag")
+            self.assertTrue((out / "W01" / "pipeline_run.json").exists())
+
+    def test_snapshot_only_then_finish_with_option_b(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            adf_file = Path(td) / "activity.json"
+            adf_file.write_text(json.dumps(ACTIVITY_RUN), encoding="utf-8")
+            connections = [FakeConnection(sql_data()), FakeConnection(sql_data(writelog_ms=4000))]
+            opened = []
+
+            def fake_open(**kwargs):
+                opened.append(kwargs)
+                return connections[len(opened) - 1]
+
+            ended = c.utc_now()
+            with patch.object(c, "open_sql_connection", side_effect=fake_open):
+                self.start(out, "--server", "sql-dev.example", "--database", "LoadTest")
+                with patch.object(c, "acquire_management_token", return_value="tok"), \
+                     patch.object(c, "get_pipeline_run",
+                                  side_effect=[pipeline_run("InProgress", "run-7"),
+                                               pipeline_run("Succeeded", "run-7", ended=ended)]), \
+                     patch.object(c.time, "sleep"):
+                    # No verdict needed: --snapshot-only does not write the record.
+                    code, printed = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out), "--wait",
+                                                  "--pipeline-run-id", "run-7", "--snapshot-only", *self.AZURE)
+                self.assertEqual(code, 0, printed)
+                self.assertIn("--adf-output-file", printed)
+                self.assertTrue((out / "W01" / "after.json").exists())
+                self.assertFalse((out / "W01" / "benchmark_record.json").exists())
+
+                # Later: finish with the saved file. The snapshot is reused, not retaken.
+                code, printed = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out),
+                                              "--adf-output-file", str(adf_file), *self.VERDICT)
+                self.assertEqual(code, 0, printed)
+
+            self.assertEqual(len(opened), 2, "one connection for 'start', one for the snapshot at completion")
+            record = json.loads((out / "W01" / "benchmark_record.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["test"]["pipeline_run_id"], "run-7")
+            self.assertIsNotNone(record["test"]["snapshot_lag_seconds"])
+            self.assertTrue(record["sink"]["collected"])
+
+    def test_no_sql_is_read_while_waiting(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            connections = [FakeConnection(sql_data()), FakeConnection(sql_data())]
+            log = []
+
+            def fake_open(**kwargs):
+                log.append("sql")
+                return connections[len([e for e in log if e == "sql"]) - 1]
+
+            def fake_get(*args):
+                log.append("status check")
+                return pipeline_run("Succeeded" if log.count("status check") == 3 else "InProgress",
+                                    "run-1", ended=c.utc_now())
+
+            with patch.object(c, "open_sql_connection", side_effect=fake_open):
+                self.start(out, "--server", "sql-dev.example", "--database", "LoadTest")
+                with patch.object(c, "acquire_management_token", return_value="tok"), \
+                     patch.object(c, "get_pipeline_run", side_effect=fake_get), \
+                     patch.object(c.time, "sleep"):
+                    code, _ = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out), "--wait",
+                                            "--pipeline-run-id", "run-1", "--snapshot-only", *self.AZURE)
+            self.assertEqual(code, 0)
+            self.assertEqual(log, ["sql", "status check", "status check", "status check", "sql"])
+
+    def test_wait_is_skipped_when_the_load_was_already_measured(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            adf_file = Path(td) / "activity.json"
+            adf_file.write_text(json.dumps(ACTIVITY_RUN), encoding="utf-8")
+            connections = [FakeConnection(sql_data()), FakeConnection(sql_data())]
+            opened = []
+            with patch.object(c, "open_sql_connection",
+                              side_effect=lambda **k: opened.append(k) or connections[len(opened) - 1]):
+                self.start(out, "--server", "sql-dev.example", "--database", "LoadTest")
+                (out / "W01" / "after.json").write_text(
+                    json.dumps(c.capture_sql_snapshot(connections[1])), encoding="utf-8")
+                with patch.object(c, "get_pipeline_run") as get:
+                    code, printed = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out), "--wait",
+                                                  "--pipeline-run-id", "run-1", *self.AZURE,
+                                                  "--adf-output-file", str(adf_file), *self.VERDICT)
+            self.assertEqual(code, 0, printed)
+            get.assert_not_called()
+
+    def test_wait_options_are_checked_before_anything_is_measured(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            self.start(out, "--no-sql")
+            cases = [
+                ["--wait", "--pipeline-name", "PL_Test", *self.VERDICT],                       # no Azure details
+                ["--wait", *self.AZURE, *self.VERDICT],                                        # no pipeline
+                ["--wait", "--pipeline-name", "PL_Test", "--poll-seconds", "2", *self.AZURE, *self.VERDICT],
+                ["--wait", "--pipeline-name", "PL_Test", "--timeout-hours", "0", *self.AZURE, *self.VERDICT],
+            ]
+            for extra in cases:
+                with self.subTest(extra=extra), patch.object(c, "acquire_management_token") as token:
+                    code, _ = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out), *extra)
+                    self.assertEqual(code, 2)
+                    token.assert_not_called()
+
+    def test_ctrl_c_keeps_the_before_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            self.start(out, "--no-sql")
+            with patch.object(c, "acquire_management_token", return_value="tok"), \
+                 patch.object(c, "find_pipeline_runs", side_effect=KeyboardInterrupt):
+                code, _ = self.run_main("stop", "--test-id", "W01", "--output-dir", str(out), "--wait",
+                                        "--pipeline-name", "PL_Test", *self.AZURE, *self.VERDICT)
+            self.assertEqual(code, 130)
+            self.assertTrue((out / "W01" / "before.json").exists())
+
+    def test_restarting_a_test_removes_the_old_pipeline_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "benchmarks"
+            self.start(out, "--no-sql")
+            (out / "W01" / "pipeline_run.json").write_text("{}", encoding="utf-8")
+            self.start(out, "--no-sql", "--force")
+            self.assertFalse((out / "W01" / "pipeline_run.json").exists())
 
 
 if __name__ == "__main__":

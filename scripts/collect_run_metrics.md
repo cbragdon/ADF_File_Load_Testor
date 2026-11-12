@@ -18,7 +18,13 @@ A test is recorded with two commands, one on each side of the ADF run.
 | --- | --- | --- | --- |
 | 1 | `start` | Immediately before the ADF pipeline starts | Takes a "before" snapshot of the SQL sink and opens the test |
 | 2 | (run the ADF pipeline) | | |
-| 3 | `stop` | Immediately after the ADF pipeline finishes | Takes the "after" snapshot, calculates what changed, reads the Copy activity result, and writes the record |
+| 3 | `stop` | After the ADF pipeline finishes | Takes the "after" snapshot, calculates what changed, reads the Copy activity result, and writes the record |
+
+You don't have to watch the pipeline and run `stop` at the right moment. Run
+`stop --wait` straight after starting the pipeline instead. It checks the
+run's status in ADF every 30 seconds and takes the "after" snapshot as soon as
+the run finishes, whether that takes five minutes or five hours. See
+[Let the collector wait](#3-let-the-collector-wait-for-the-pipeline).
 
 Two commands are needed because the SQL counters are cumulative. One reading
 says nothing about one load. Only the difference between a reading taken before
@@ -46,7 +52,7 @@ python -m pip install pyodbc azure-identity
 | --- | --- | --- |
 | SQL Server and SQL Managed Instance | Permission to view server state | Wait statistics and file I/O counters are server-level views |
 | Azure SQL Database | Permission to view database state | The database-scoped wait and I/O views are used |
-| Data factory (Azure option only) | Read access to the factory's pipeline runs | To read the Copy activity run |
+| Data factory (option A and `--wait` only) | Read access to the factory's pipeline runs | To check the run's status and read the Copy activity run |
 
 These are the same permissions the scripts in `sql\monitoring\` need. The
 collector accepts no password, key, or token. SQL and Azure access use your
@@ -152,14 +158,66 @@ as soon as it returns.
 `--auth` accepts `windows` (default), `entra-default`, or `entra-interactive`,
 exactly as the file generator does.
 
-### 2. Run the ADF pipeline
+### 2. Start the ADF pipeline
 
-Let the pipeline finish. Keep other work off the sink while it runs (see
-[Limits](#limits)).
+Start it however you normally do: from ADF Studio, a trigger, or a script.
+The collector does not start it. Keep other work off the sink while it runs
+(see [Limits](#limits)).
 
-### 3. Stop, immediately after the load
+### 3. Let the collector wait for the pipeline
 
-Choose one of two ways to give the script the Copy activity result.
+This is the easiest way to finish a test. Run it straight after starting the
+pipeline, then leave it.
+
+```powershell
+python .\scripts\collect_run_metrics.py stop `
+    --test-id DIU-08-run1 `
+    --wait `
+    --pipeline-name PL_Blob_to_SqlMi_Orders `
+    --subscription-id 00000000-0000-0000-0000-000000000000 `
+    --resource-group rg-data-dev `
+    --factory adf-data-dev `
+    --change "DIU 4 -> 8" `
+    --result PASS `
+    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
+```
+
+While it waits, it prints each status change (Queued, InProgress, then
+Succeeded) and a short "still waiting" line every ten minutes. When the run
+finishes, it takes the "after" snapshot straight away, reads the result from
+Azure (option A below), and writes the record.
+
+Things to know:
+
+- **It finds the run for you.** It follows the run of `--pipeline-name` that
+  started after `start`. If you already have the run ID, use
+  `--pipeline-run-id` instead. If two runs of the pipeline started after
+  `start`, it stops and lists them so you can pick one.
+- **It doesn't touch the sink while it waits.** It only asks ADF for the run's
+  status. The sink is read twice in the whole test: at `start`, and when the
+  run finishes. Waiting adds no load to what you're measuring.
+- **It waits for a final status.** Succeeded, Failed, and Cancelled all end
+  the wait. A failed or cancelled run is still recorded, with a warning, so you
+  can see what happened.
+- **Change the timing if you need to.** `--poll-seconds` sets how often it
+  checks (default 30, minimum 10). `--timeout-hours` sets how long it waits
+  before giving up (default 12).
+- **Ctrl+C is safe.** It stops waiting and keeps the "before" snapshot. Run
+  the same command again to carry on.
+- **Keep the computer awake.** If it sleeps, the checks pause and the "after"
+  snapshot is taken late. The record warns you when that happens.
+
+**To finish with a saved file (option B) instead,** add `--snapshot-only`. The
+collector waits, takes the "after" snapshot when the run finishes, and stops
+there. Save the Copy activity output from ADF Studio whenever it suits you, then
+finish the record with the option B command below. It reuses the snapshot that
+was taken at completion. The verdict isn't needed until that second command.
+
+### 4. Or stop by hand, after the load
+
+If you'd rather not wait with the collector, run `stop` yourself as soon as
+the pipeline finishes. Choose one of two ways to give it the Copy activity
+result.
 
 **Option A: read the run from Azure.** Copy the pipeline run ID from the ADF
 Studio Monitor tab.
@@ -206,7 +264,7 @@ script asks for them. The runbook treats the reason for the next action as the
 point of the record: it stops tuning from becoming a sequence of unexplained
 setting changes.
 
-### 4. Review
+### 5. Review
 
 ```powershell
 python .\scripts\collect_run_metrics.py list
@@ -223,6 +281,7 @@ excludes from Git. Use `--output-dir` to write somewhere else.
 | --- | --- |
 | `<test-id>\before.json` | The "before" SQL snapshot and how to reconnect for `stop` (no secrets) |
 | `<test-id>\after.json` | The "after" SQL snapshot |
+| `<test-id>\pipeline_run.json` | The pipeline run `--wait` followed: name, run ID, final status, start and end times |
 | `<test-id>\adf_activity.json` | The Copy activity result exactly as received |
 | `<test-id>\benchmark_record.json` | The benchmark record, for programs |
 | `<test-id>\benchmark_record.md` | The same record, for people |
@@ -252,8 +311,8 @@ be checked and changed without reading the code first.
    64 characters.
 2. **Refuses to overwrite.** If the test folder already holds a `before.json`,
    the command stops. With `--force` it begins the test again and first deletes
-   `after.json`, `adf_activity.json`, and both record files, so results from
-   two attempts are never mixed.
+   `after.json`, `pipeline_run.json`, `adf_activity.json`, and both record
+   files, so results from two attempts are never mixed.
 3. **Opens `collector.log`** in the test folder. Every later step is logged
    there with a UTC time.
 4. **Records who and where:** the test ID, the environment label, the UTC
@@ -275,29 +334,66 @@ be checked and changed without reading the code first.
    command stops.
 2. **Refuses to overwrite** an existing benchmark record unless `--force` is
    given.
-3. **Checks for the verdict first.** When no terminal is attached, for
-   example in a scheduled job, `--result` and `--next-action-reason` must be on
-   the command line. This check runs before anything is measured, so a missing
-   value cannot leave a half-finished test behind.
-4. **Takes the "after" snapshot before anything slower.** Reading ADF from
+3. **Checks its options first.** With `--wait`, it checks that the factory and
+   the pipeline are named and that the timing values make sense. When no
+   terminal is attached, for example in a scheduled job, `--result` and
+   `--next-action-reason` must be on the command line (except with
+   `--snapshot-only`, which writes no record). These checks run before
+   anything is measured, so a mistake can't leave a half-finished test.
+4. **Waits for the pipeline,** with `--wait` (see
+   [How waiting works](#how-waiting-works)). If an `after.json` already
+   exists, the load has already been measured, so there is nothing to wait
+   for and this step is skipped.
+5. **Takes the "after" snapshot before anything slower.** Reading ADF from
    Azure can take several seconds, so the snapshot comes first. That keeps the
    SQL measurement window as close to the end of the load as possible.
-   - If an `after.json` already exists because an earlier `stop` failed
-     part-way, it is reused. Taking a new snapshot later would stretch the
-     window beyond the load.
-5. **Calculates the differences** between the two snapshots (see
+   - If an `after.json` already exists, because an earlier `stop` failed
+     part-way or `--snapshot-only` was used, it is reused. Taking a new
+     snapshot later would stretch the window beyond the load.
+6. **Calculates the differences** between the two snapshots (see
    [How the differences are calculated](#how-the-differences-are-calculated)).
-6. **Obtains the Copy activity result,** from the file or from Azure (see
+   With `--snapshot-only`, the command ends here.
+7. **Obtains the Copy activity result,** from the file or from Azure (see
    [How the ADF result is read](#how-the-adf-result-is-read)), and saves it
-   unchanged as `adf_activity.json`.
-7. **Extracts the benchmark values** from the result, using the property
+   unchanged as `adf_activity.json`. When `--wait` found the run, its run ID
+   is used, so you never have to copy it.
+8. **Extracts the benchmark values** from the result, using the property
    names in Microsoft's "Monitor copy activity" documentation. Any value the
    result does not contain is recorded as "not recorded", never estimated.
-8. **Asks for the verdict and reason** if they were not on the command line.
-9. **Builds the record**, adds its warnings, and writes
-   `benchmark_record.json` and `benchmark_record.md`.
-10. **Rebuilds `benchmark_index.csv`** from every record in the output
+9. **Asks for the verdict and reason** if they were not on the command line.
+10. **Builds the record**, adds its warnings, and writes
+    `benchmark_record.json` and `benchmark_record.md`.
+11. **Rebuilds `benchmark_index.csv`** from every record in the output
     folder, sorted by start time.
+
+### How waiting works
+
+`--wait` calls only the ADF management API. It never connects to the sink
+while it waits, so the measurement isn't disturbed by the measuring.
+
+1. **Find the run.** With `--pipeline-name`, it lists that pipeline's recent
+   runs and picks the one that started after `start`. It allows two minutes'
+   difference between your computer's clock and Azure's. If no run has started
+   yet, it keeps checking. With `--pipeline-run-id`, it reads that run
+   directly.
+2. **Follow that run.** Once a run is found, every later check reads it by its
+   run ID, so a second run started later can't be mistaken for it.
+3. **Check at a fixed interval.** Each check reads the run's status. Queued,
+   InProgress, and Canceling mean keep waiting. Succeeded, Failed, and
+   Cancelled end the wait.
+4. **Ride out short faults.** A dropped connection, throttling, or a server
+   error is logged and retried at the next check. Ten failures in a row stop
+   the wait. A fault that retrying can't fix, such as a wrong factory name or
+   missing access, stops it at once.
+5. **Stay signed in.** The Azure sign-in is renewed automatically as it
+   nears expiry, so a long wait doesn't need you to sign in again.
+6. **Record what it saw.** When the run finishes, its name, run ID, status,
+   and start and end times are saved in `pipeline_run.json` and copied into
+   the record.
+
+The record also shows how long after the run ended the "after" snapshot was
+taken. Normally that is under one check interval. A much longer gap means the
+checks stopped for a while, usually because the computer went to sleep.
 
 ### What `list` does
 
@@ -388,12 +484,15 @@ Besides the SQL warnings above, the record warns when:
 - only the output section was supplied, so configured values are unknown
 - the SQL window is longer than one and a half times the copy duration plus
   60 seconds, which means `start` or `stop` was run too far from the load
+- with `--wait`, the pipeline run ended with a status other than Succeeded
+- with `--wait`, the "after" snapshot was taken more than two check intervals
+  plus 60 seconds after the run ended
 
 ## How the record maps to the runbook
 
 | Runbook section 11 field | Where the value comes from |
 | --- | --- |
-| Test ID, environment, timestamp | `start` arguments and the snapshot times |
+| Test ID, environment, timestamp | `start` arguments and the snapshot times; with `--wait`, also the pipeline name, run ID, and final status |
 | Source GiB and row count | Copy activity `dataRead` and `rowsRead` |
 | Source file count | Copy activity `filesRead` |
 | Configured and actual DIUs | Activity input `dataIntegrationUnits`; output `usedDataIntegrationUnits` |
@@ -431,7 +530,9 @@ before comparing runs.
 | Warning | What it means | What to do |
 | --- | --- | --- |
 | Wait statistics are instance-wide | On SQL Server and SQL MI the wait view covers the whole instance | Run tests on an otherwise quiet instance |
-| SQL measurements cover more time than the copy ran | `start` or `stop` was run too far from the load | Run them immediately before and after the load |
+| SQL measurements cover more time than the copy ran | `start` or `stop` was run too far from the load | Run `start` just before the pipeline, and use `stop --wait` |
+| The pipeline run finished with a status other than Succeeded | The run failed or was cancelled | Read the run's error in ADF Studio before using the numbers |
+| The "after" snapshot was taken long after the pipeline finished | The checks paused, usually because the computer slept | Keep the computer awake during the test, or repeat it |
 | Counters were reset between the snapshots | The instance restarted or failed over during the test | Repeat the test |
 | The transaction log grew during the test | Log growth happened inside the run | Do not compare this run with runs that started with space already allocated |
 | Rows read do not equal rows copied | Rows were skipped or the copy failed | Treat the run as a correctness failure until explained |
@@ -447,6 +548,8 @@ before comparing runs.
   the ADF file name was mistyped), run it again. It reuses the snapshot it
   already took. Taking a new one later would stretch the measurement window
   beyond the load.
+- If `stop --wait` is stopped with Ctrl+C, times out, or loses Azure for too
+  long, nothing is lost. Run the same command again and it carries on waiting.
 
 ## How it relates to the monitoring scripts
 
@@ -463,9 +566,14 @@ is running, as the monitoring guide describes.
   to record with `--activity-name`.
 - **Instance-wide waits.** On SQL Server and SQL MI, wait statistics include
   every workload on the instance during the test window.
-- **The window is start-to-stop.** SQL numbers cover the time between the two
-  commands, not only the copy. The record shows both durations and warns when
-  they differ by much.
+- **The window is start-to-stop.** SQL numbers cover the time between the
+  "before" and "after" snapshots, which includes the whole pipeline, not only
+  the Copy activity. The record shows both durations and warns when they
+  differ by much.
+- **Waiting needs Azure access.** `--wait` checks the run's status through the
+  ADF management API, so it needs the same access as option A.
+- **Waiting needs the computer awake.** The checks run on your computer. If it
+  sleeps or shuts down, the wait pauses or stops.
 - **Copy activity loads only.** Loads that do not use a Copy activity are not
   covered.
 - **Sinks other than SQL.** Use `start --no-sql`. The record then holds the ADF
@@ -494,5 +602,11 @@ first use, check one record by hand:
 | `No 'before' snapshot found` | `stop` was run without `start`, or with a different `--output-dir` | Run `start` first; use the same `--output-dir` for both |
 | `No Copy activity ... was found` | The run ID belongs to a pipeline with no Copy activity, or the name is wrong | Check the run ID and `--activity-name` |
 | `more than one matching Copy activity run` | Several Copy activities, or a retried activity | Use `--activity-name`, or save the attempt you want and use `--adf-output-file` |
-| `Azure returned HTTP 401` or `403` | Your sign-in cannot read the factory's runs | Sign in with `az login` or `Connect-AzAccount`, and check your access to the factory |
-| `requires azure-identity` | The Azure option was used without the package | Install it, or use `--adf-output-file` |
+| `Azure returned HTTP 401` or `403` | Your sign-in can't read the factory's runs | Sign in with `az login` or `Connect-AzAccount`, and check your access to the factory |
+| `Azure returned HTTP 404` | The subscription, resource group, factory, or run ID is wrong | Check each value in the Azure portal |
+| `requires azure-identity` | The Azure option or `--wait` was used without the package | Install it |
+| `--wait needs --pipeline-name` | `--wait` doesn't know which run to follow | Add `--pipeline-name`, or `--pipeline-run-id` |
+| `More than one run of the pipeline started after 'start'` | The pipeline was started twice, or a trigger also ran it | Use `--pipeline-run-id` with the run that belongs to the test |
+| `did not finish within ... hours` | The run is still going when the timeout ends | Run the same command again, or raise `--timeout-hours` |
+| `failed status checks in a row` | Azure couldn't be reached for about five minutes | Check the network or VPN, then run the same command again |
+| Status stays `not started yet` | The pipeline wasn't started, or `--pipeline-name` is wrong | Start the pipeline, or check the name in ADF Studio |

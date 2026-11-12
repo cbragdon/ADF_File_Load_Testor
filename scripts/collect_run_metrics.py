@@ -20,9 +20,15 @@ A test is recorded with two commands, one on each side of the ADF run:
 1. ``start``  - run immediately BEFORE the ADF pipeline is started. It takes
    a "before" snapshot of the SQL sink (wait statistics, file I/O counters,
    and transaction-log usage) and saves it in the test folder.
-2. ``stop``   - run immediately AFTER the ADF pipeline finishes. It takes the
-   "after" snapshot, calculates what changed during the load, reads the Copy
-   activity result from ADF, and writes the benchmark record.
+2. ``stop``   - run AFTER the ADF pipeline finishes. It takes the "after"
+   snapshot, calculates what changed during the load, reads the Copy activity
+   result from ADF, and writes the benchmark record.
+
+   With ``--wait``, ``stop`` can be run straight after ``start`` instead. It
+   checks the pipeline run's status in ADF at a fixed interval and takes the
+   "after" snapshot the moment the run finishes, however long that takes.
+   While it waits it reads nothing from the SQL sink, so waiting adds no load
+   to the system being measured.
 
 Two commands are needed because the SQL counters are cumulative. A single
 reading says nothing about one load; only the difference between a reading
@@ -119,10 +125,36 @@ MANAGEMENT_ENDPOINT = "https://management.azure.com"
 MANAGEMENT_SCOPE = "https://management.azure.com/.default"
 DATA_FACTORY_API_VERSION = "2018-06-01"
 
+# Pipeline run statuses. ADF reports Queued, InProgress, Canceling, and the
+# three final statuses below. Waiting ends only on a final status; Canceling
+# is not final, because the run may still be writing to the sink.
+FINAL_PIPELINE_STATUSES: tuple[str, ...] = ("Succeeded", "Failed", "Cancelled")
+
+# Waiting defaults, and the shortest check interval allowed. Checking more
+# often than every 10 seconds gains nothing and adds calls to the ADF API.
+DEFAULT_POLL_SECONDS = 30
+MINIMUM_POLL_SECONDS = 10
+DEFAULT_TIMEOUT_HOURS = 12.0
+
+# A pipeline run found by name must have started after 'start', allowing this
+# much difference between the local clock and Azure's.
+CLOCK_TOLERANCE_SECONDS = 120
+
+# Stop waiting after this many failed status checks in a row. Single failures
+# (a dropped connection, throttling) are expected over a long wait.
+MAX_CONSECUTIVE_CHECK_FAILURES = 10
+
+# While waiting, write a "still waiting" line at most this often, so a
+# twelve-hour wait does not fill the log with identical lines.
+WAIT_HEARTBEAT_SECONDS = 600
+
+# HTTP status codes worth retrying while waiting: throttling and server faults.
+RETRYABLE_HTTP_CODES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+
 # Files that belong to a finished or half-finished test. 'start --force'
 # removes them so a restarted test cannot inherit results from the old one.
 STALE_ON_RESTART: tuple[str, ...] = (
-    "after.json", "adf_activity.json", "benchmark_record.json", "benchmark_record.md",
+    "after.json", "pipeline_run.json", "adf_activity.json", "benchmark_record.json", "benchmark_record.md",
 )
 
 # Columns of benchmark_index.csv, in order. Each value is a path into the
@@ -133,6 +165,9 @@ INDEX_COLUMNS: tuple[tuple[str, str], ...] = (
     ("StartedAtUtc", "test.started_at_utc"),
     ("StoppedAtUtc", "test.stopped_at_utc"),
     ("Result", "outcome.result"),
+    ("PipelineName", "test.pipeline_name"),
+    ("PipelineRunId", "test.pipeline_run_id"),
+    ("PipelineStatus", "test.pipeline_status"),
     ("ChangeUnderTest", "outcome.change_under_test"),
     ("SourceGiB", "source.gib"),
     ("SourceRowCount", "source.row_count"),
@@ -146,6 +181,7 @@ INDEX_COLUMNS: tuple[tuple[str, str], ...] = (
     ("TableLock", "settings.table_lock"),
     ("TargetTableDesign", "settings.target_table_design"),
     ("CopyDurationSeconds", "result.copy_duration_seconds"),
+    ("SnapshotLagSeconds", "test.snapshot_lag_seconds"),
     ("ThroughputMiBPerSecond", "result.throughput_mib_per_second"),
     ("RowsPerSecond", "result.rows_per_second"),
     ("RowsCopied", "result.rows_copied"),
@@ -185,6 +221,29 @@ def to_iso(moment: datetime) -> str:
 def from_iso(text: str) -> datetime:
     """Parse a string produced by :func:`to_iso`."""
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def parse_adf_time(text: str | None) -> datetime | None:
+    """Parse a time from the ADF API, for example 2026-11-11T21:01:35.1234567Z.
+
+    ADF can return up to seven digits of fractional seconds, more than Python
+    reads directly, so the fraction is cut to six digits before parsing.
+    Returns None for a missing or unreadable value.
+    """
+    if not text:
+        return None
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$", str(text))
+    if not match:
+        return None
+    base, fraction, zone = match.groups()
+    moment = datetime.strptime(base, "%Y-%m-%dT%H:%M:%S")
+    if fraction:
+        moment = moment.replace(microsecond=int(fraction[:6].ljust(6, "0")))
+    if zone and zone != "Z":
+        sign = 1 if zone[0] == "+" else -1
+        offset = timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6]))
+        return (moment - sign * offset).replace(tzinfo=timezone.utc)
+    return moment.replace(tzinfo=timezone.utc)
 
 
 def validate_test_id(test_id: str) -> str:
@@ -644,6 +703,9 @@ def summarise_copy_activity(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_CREDENTIAL: Any = None  # created on first use, then reused for the life of the process
+
+
 def acquire_management_token() -> str:
     """Get an Azure management token for the person running the script.
 
@@ -659,11 +721,16 @@ def acquire_management_token() -> str:
             "python -m pip install azure-identity   (or save the activity output from ADF Studio "
             "and pass it with --adf-output-file instead)."
         ) from exc
-    credential = DefaultAzureCredential(
-        exclude_environment_credential=True,
-        exclude_managed_identity_credential=True,
-    )
-    return credential.get_token(MANAGEMENT_SCOPE).token
+    global _CREDENTIAL
+    if _CREDENTIAL is None:
+        _CREDENTIAL = DefaultAzureCredential(
+            exclude_environment_credential=True,
+            exclude_managed_identity_credential=True,
+        )
+    # The credential object caches the token and renews it when it nears
+    # expiry, so calling this before every status check keeps a long wait
+    # signed in without asking the person to sign in again.
+    return _CREDENTIAL.get_token(MANAGEMENT_SCOPE).token
 
 
 def query_activity_runs(
@@ -743,6 +810,177 @@ def select_copy_activity(runs: Sequence[dict[str, Any]], activity_name: str | No
 
 
 # ---------------------------------------------------------------------------
+# Waiting for the pipeline run to finish
+# ---------------------------------------------------------------------------
+
+class AzureCallError(RuntimeError):
+    """A call to the Azure management API failed.
+
+    ``retryable`` is True for faults that usually clear on their own, such as
+    throttling, a server error, or a dropped connection. While waiting, those
+    are retried; anything else (a wrong name, no access) stops at once.
+    """
+
+    def __init__(self, message: str, retryable: bool):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _factory_url(subscription_id: str, resource_group: str, factory: str) -> str:
+    return (
+        f"{MANAGEMENT_ENDPOINT}/subscriptions/{urllib.parse.quote(subscription_id, safe='')}"
+        f"/resourceGroups/{urllib.parse.quote(resource_group, safe='')}"
+        f"/providers/Microsoft.DataFactory/factories/{urllib.parse.quote(factory, safe='')}"
+    )
+
+
+def _call_management_api(url: str, body: dict[str, Any] | None, token: str,
+                         opener: Callable[..., Any]) -> dict[str, Any]:
+    """Send one GET (no body) or POST (with a body) to the management API and return its JSON."""
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="GET" if body is None else "POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with opener(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise AzureCallError(
+            f"Azure returned HTTP {exc.code}. Check the subscription, resource group, factory, "
+            f"pipeline name or run ID, and your access. Detail: {detail}",
+            retryable=exc.code in RETRYABLE_HTTP_CODES,
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise AzureCallError(f"Could not reach the Azure management endpoint: {reason}", retryable=True) from exc
+
+
+def get_pipeline_run(subscription_id: str, resource_group: str, factory: str, run_id: str, token: str,
+                     opener: Callable[..., Any] = urllib.request.urlopen) -> dict[str, Any]:
+    """Read one pipeline run, including its current status, by run ID."""
+    url = (
+        f"{_factory_url(subscription_id, resource_group, factory)}"
+        f"/pipelineruns/{urllib.parse.quote(run_id, safe='')}?api-version={DATA_FACTORY_API_VERSION}"
+    )
+    return _call_management_api(url, None, token, opener)
+
+
+def find_pipeline_runs(subscription_id: str, resource_group: str, factory: str, pipeline_name: str,
+                       window_start: datetime, window_end: datetime, token: str,
+                       opener: Callable[..., Any] = urllib.request.urlopen) -> list[dict[str, Any]]:
+    """List the runs of one pipeline updated within a time window, following result paging."""
+    url = (
+        f"{_factory_url(subscription_id, resource_group, factory)}"
+        f"/queryPipelineRuns?api-version={DATA_FACTORY_API_VERSION}"
+    )
+    runs: list[dict[str, Any]] = []
+    continuation: str | None = None
+    for _ in range(100):  # hard stop so a service fault can never loop forever
+        body: dict[str, Any] = {
+            "lastUpdatedAfter": to_iso(window_start),
+            "lastUpdatedBefore": to_iso(window_end),
+            "filters": [{"operand": "PipelineName", "operator": "Equals", "values": [pipeline_name]}],
+        }
+        if continuation:
+            body["continuationToken"] = continuation
+        page = _call_management_api(url, body, token, opener)
+        runs.extend(page.get("value") or [])
+        continuation = page.get("continuationToken")
+        if not continuation:
+            return runs
+    raise AzureCallError("Stopped reading pipeline runs after 100 pages; the result is incomplete.", retryable=False)
+
+
+def choose_pipeline_run(runs: Sequence[dict[str, Any]], started_at: datetime) -> dict[str, Any] | None:
+    """Pick the run that belongs to this test: the one that started after 'start'.
+
+    Returns None while no such run exists yet, for example because the
+    pipeline has not been started. If more than one run started after
+    'start', the test is ambiguous, so the person must name the run with
+    --pipeline-run-id.
+    """
+    earliest = started_at - timedelta(seconds=CLOCK_TOLERANCE_SECONDS)
+    candidates = []
+    for run in runs:
+        run_start = parse_adf_time(run.get("runStart"))
+        if run_start is not None and run_start >= earliest:
+            candidates.append(run)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    listed = ", ".join(f"{run.get('runId')} (started {run.get('runStart')})" for run in candidates)
+    raise AzureCallError(
+        f"More than one run of the pipeline started after 'start': {listed}. "
+        "Use --pipeline-run-id to name the run for this test.",
+        retryable=False,
+    )
+
+
+def wait_for_pipeline_run(
+    check: Callable[[], dict[str, Any] | None],
+    poll_seconds: float,
+    timeout_seconds: float,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """Call ``check`` every ``poll_seconds`` until the pipeline run reaches a final status.
+
+    ``check`` returns the pipeline run, or None while the run has not
+    appeared yet. Each status change is logged when it happens, with a short
+    "still waiting" line every ten minutes in between.
+
+    Raises TimeoutError when ``timeout_seconds`` pass first, and
+    AzureCallError when a check fails in a way that retrying will not fix, or
+    fails too many times in a row.
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    started = clock()
+    deadline = started + timeout_seconds
+    last_status: str | None = None
+    last_heartbeat = started
+    failures = 0
+    while True:
+        try:
+            run = check()
+            failures = 0
+        except AzureCallError as exc:
+            if not exc.retryable:
+                raise
+            failures += 1
+            LOG.warning("Status check failed (%d in a row): %s", failures, exc)
+            if failures >= MAX_CONSECUTIVE_CHECK_FAILURES:
+                raise AzureCallError(
+                    f"Stopped waiting after {failures} failed status checks in a row. "
+                    "The 'before' snapshot is kept; run 'stop --wait' again when Azure is reachable.",
+                    retryable=False,
+                ) from exc
+        else:
+            status = "not started yet" if run is None else str(run.get("status"))
+            if status != last_status:
+                where = "" if run is None else f" (run {run.get('runId')})"
+                LOG.info("Pipeline status: %s%s", status, where)
+                last_status, last_heartbeat = status, clock()
+            elif clock() - last_heartbeat >= WAIT_HEARTBEAT_SECONDS:
+                LOG.info("Still waiting; status %s after %.0f minutes.", status, (clock() - started) / 60)
+                last_heartbeat = clock()
+            if run is not None and run.get("status") in FINAL_PIPELINE_STATUSES:
+                return run
+        if clock() >= deadline:
+            raise TimeoutError(
+                f"The pipeline did not finish within {timeout_seconds / 3600:g} hours "
+                f"(last status: {last_status}). The 'before' snapshot is kept; run 'stop --wait' "
+                "again to keep waiting, or raise --timeout-hours."
+            )
+        sleep(poll_seconds)
+
+
+# ---------------------------------------------------------------------------
 # Benchmark record
 # ---------------------------------------------------------------------------
 
@@ -751,18 +989,35 @@ def build_benchmark_record(
     notes: dict[str, Any],
     copy: dict[str, Any],
     sink: dict[str, Any] | None,
+    waited: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the benchmark record in the order of runbook section 11.
 
-    ``test``  - identity of the test: ID, environment, times, who recorded it
-    ``notes`` - what only the tester knows: what changed, the target table
-                design, cost, the correctness result, the verdict, and the
-                reason for the next action
-    ``copy``  - output of :func:`summarise_copy_activity`
-    ``sink``  - output of :func:`compute_sql_deltas`, or None when the sink is
-                not a SQL database or SQL collection was switched off
+    ``test``   - identity of the test: ID, environment, times, who recorded it
+    ``notes``  - what only the tester knows: what changed, the target table
+                 design, cost, the correctness result, the verdict, and the
+                 reason for the next action
+    ``copy``   - output of :func:`summarise_copy_activity`
+    ``sink``   - output of :func:`compute_sql_deltas`, or None when the sink is
+                 not a SQL database or SQL collection was switched off
+    ``waited`` - contents of pipeline_run.json when 'stop --wait' found the
+                 run, or None when waiting was not used
     """
     warnings: list[str] = []
+
+    if waited:
+        pipeline_status = waited.get("status")
+        if pipeline_status and pipeline_status != "Succeeded":
+            warnings.append(f"The pipeline run finished with status {pipeline_status!r}, not 'Succeeded'.")
+        lag = waited.get("snapshot_lag_seconds")
+        poll = waited.get("poll_seconds") or DEFAULT_POLL_SECONDS
+        # A lag much longer than one check interval means the waiting stopped
+        # for a while, most often because the computer went to sleep.
+        if lag is not None and lag > poll * 2 + 60:
+            warnings.append(
+                f"The 'after' snapshot was taken {lag:,.0f} s after the pipeline finished, much longer than "
+                f"the {poll:g} s check interval. Was the computer asleep? Activity after the load may be included."
+            )
 
     status = copy.get("status")
     if status and str(status).lower() != "succeeded":
@@ -890,6 +1145,10 @@ def render_markdown(record: dict[str, Any]) -> str:
         f"| Started (UTC) | {_show(test.get('started_at_utc'))} |",
         f"| Stopped (UTC) | {_show(test.get('stopped_at_utc'))} |",
         f"| Recorded by | {_show(test.get('recorded_by'))} |",
+        f"| Pipeline | {_show(test.get('pipeline_name'))} |",
+        f"| Pipeline run ID | {_show(test.get('pipeline_run_id'))} |",
+        f"| Pipeline status | {_show(test.get('pipeline_status'))} |",
+        f"| Snapshot taken after the pipeline finished | {_show(test.get('snapshot_lag_seconds'), 's')} |",
         f"| Change under test | {_show(outcome.get('change_under_test'))} |",
         "",
         "## Source",
@@ -1139,8 +1398,12 @@ def command_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_copy_payload(args: argparse.Namespace, started_at: datetime) -> dict[str, Any]:
-    """Obtain the Copy activity result from a file or from Azure."""
+def _load_copy_payload(args: argparse.Namespace, started_at: datetime, run_id: str | None) -> dict[str, Any]:
+    """Obtain the Copy activity result from a file or from Azure.
+
+    ``run_id`` is the pipeline run to read from Azure: the one given with
+    --pipeline-run-id, or the one 'stop --wait' found.
+    """
     if args.adf_output_file:
         payload = read_json(Path(args.adf_output_file))
         if isinstance(payload, dict) and isinstance(payload.get("value"), list):
@@ -1151,21 +1414,65 @@ def _load_copy_payload(args: argparse.Namespace, started_at: datetime) -> dict[s
         LOG.info("Read the Copy activity result from %s.", args.adf_output_file)
         return payload
 
-    azure_args = (args.subscription_id, args.resource_group, args.factory, args.pipeline_run_id)
-    if not all(azure_args):
+    if not all((args.subscription_id, args.resource_group, args.factory, run_id)):
         raise ValueError(
-            "Supply the ADF result with --adf-output-file, or supply all of --subscription-id, "
-            "--resource-group, --factory and --pipeline-run-id to read it from Azure."
+            "Supply the ADF result with --adf-output-file, or supply --subscription-id, --resource-group, "
+            "--factory and --pipeline-run-id (or --wait with --pipeline-name) to read it from Azure."
         )
     token = acquire_management_token()
     # ADF requires a time window. A day either side of the test comfortably
     # contains the run; the pipeline run ID is what actually selects it.
     runs = query_activity_runs(
-        args.subscription_id, args.resource_group, args.factory, args.pipeline_run_id,
+        args.subscription_id, args.resource_group, args.factory, run_id,
         started_at - timedelta(days=1), utc_now() + timedelta(days=1), token,
     )
-    LOG.info("Read %d activity run(s) for pipeline run %s from Azure.", len(runs), args.pipeline_run_id)
+    LOG.info("Read %d activity run(s) for pipeline run %s from Azure.", len(runs), run_id)
     return select_copy_activity(runs, args.activity_name)
+
+
+def _validate_wait_arguments(args: argparse.Namespace) -> None:
+    """Check the --wait options before anything is measured."""
+    if not all((args.subscription_id, args.resource_group, args.factory)):
+        raise ValueError("--wait needs --subscription-id, --resource-group and --factory to check the run's status.")
+    if not (args.pipeline_run_id or args.pipeline_name):
+        raise ValueError("--wait needs --pipeline-name (or --pipeline-run-id) to know which run to watch.")
+    if args.poll_seconds < MINIMUM_POLL_SECONDS:
+        raise ValueError(f"--poll-seconds must be at least {MINIMUM_POLL_SECONDS}.")
+    if args.timeout_hours <= 0:
+        raise ValueError("--timeout-hours must be greater than zero.")
+
+
+def _wait_for_completion(args: argparse.Namespace, started_at: datetime) -> dict[str, Any]:
+    """Watch the pipeline run in ADF until it finishes, and return it.
+
+    Only the ADF management API is called. Nothing is read from the SQL sink
+    while waiting, so the wait adds no load to the system being measured.
+    """
+    locked_run_id = args.pipeline_run_id
+
+    def check() -> dict[str, Any] | None:
+        nonlocal locked_run_id
+        token = acquire_management_token()
+        if locked_run_id:
+            return get_pipeline_run(args.subscription_id, args.resource_group, args.factory, locked_run_id, token)
+        runs = find_pipeline_runs(
+            args.subscription_id, args.resource_group, args.factory, args.pipeline_name,
+            started_at - timedelta(seconds=CLOCK_TOLERANCE_SECONDS), utc_now() + timedelta(hours=1), token,
+        )
+        run = choose_pipeline_run(runs, started_at)
+        if run is not None:
+            # From now on, follow this run by its ID, so a second run started
+            # later cannot be mistaken for it.
+            locked_run_id = str(run.get("runId"))
+            LOG.info("Found pipeline run %s of %s, started %s.", locked_run_id, args.pipeline_name, run.get("runStart"))
+        return run
+
+    target = args.pipeline_run_id or f"the next run of {args.pipeline_name}"
+    LOG.info(
+        "Waiting for %s to finish. Checking every %g s, for up to %g hours. Press Ctrl+C to stop waiting; "
+        "the 'before' snapshot is kept.", target, args.poll_seconds, args.timeout_hours,
+    )
+    return wait_for_pipeline_run(check, args.poll_seconds, args.timeout_hours * 3600)
 
 
 def command_stop(args: argparse.Namespace) -> int:
@@ -1173,6 +1480,8 @@ def command_stop(args: argparse.Namespace) -> int:
     test_dir = _test_dir(args)
     before_path = test_dir / "before.json"
     record_path = test_dir / "benchmark_record.json"
+    after_path = test_dir / "after.json"
+    pipeline_run_path = test_dir / "pipeline_run.json"
     if not before_path.exists():
         raise FileNotFoundError(
             f"No 'before' snapshot found for test {args.test_id!r} ({before_path}). Run 'start' before the load."
@@ -1182,25 +1491,53 @@ def command_stop(args: argparse.Namespace) -> int:
             f"Test {args.test_id!r} already has a benchmark record ({record_path}). "
             "Pass --force to replace it."
         )
+    if args.wait:
+        _validate_wait_arguments(args)
     # Fail before touching anything if the verdict cannot be obtained: with no
     # terminal there is nobody to ask, so both values must be on the command line.
-    if not sys.stdin.isatty() and not (args.result and args.next_action_reason):
+    # --snapshot-only does not write the record, so it needs no verdict.
+    if not args.snapshot_only and not sys.stdin.isatty() and not (args.result and args.next_action_reason):
         raise ValueError(
             "--result and --next-action-reason are required when no terminal is available to ask for them."
         )
     _attach_file_log(test_dir)
     session = read_json(before_path)
     started_at = from_iso(session["started_at_utc"])
+    has_sql = bool(session.get("sql") and session.get("snapshot"))
 
-    # Take the 'after' snapshot first, before anything slower, so that the
-    # measurement window ends as close to the end of the load as possible.
-    # If an 'after' snapshot already exists (an earlier 'stop' failed part-way,
-    # for example because the ADF file name was mistyped) it is reused. Taking
-    # a new one later would stretch the window beyond the load.
+    # 1. Wait for the pipeline to finish, when asked to. If an 'after'
+    #    snapshot already exists, the load has already been measured, so
+    #    there is nothing to wait for.
+    waited: dict[str, Any] | None = read_json(pipeline_run_path) if pipeline_run_path.exists() else None
+    if args.wait:
+        if has_sql and after_path.exists():
+            LOG.info("An 'after' snapshot already exists, so waiting is skipped.")
+        else:
+            run = _wait_for_completion(args, started_at)
+            finished_at = utc_now()
+            waited = {
+                "pipeline_name": run.get("pipelineName") or args.pipeline_name,
+                "run_id": run.get("runId"),
+                "status": run.get("status"),
+                "run_start": run.get("runStart"),
+                "run_end": run.get("runEnd"),
+                "duration_ms": run.get("durationInMs"),
+                "message": run.get("message"),
+                "seen_finished_at_utc": to_iso(finished_at),
+                "poll_seconds": args.poll_seconds,
+            }
+            write_json(pipeline_run_path, waited)
+            if run.get("status") != "Succeeded":
+                LOG.warning("The pipeline run finished with status %s: %s", run.get("status"), run.get("message"))
+
+    # 2. Take the 'after' snapshot before anything slower, so the measurement
+    #    window ends as close to the end of the load as possible. If one
+    #    already exists (an earlier 'stop' failed part-way, or --snapshot-only
+    #    was used) it is reused: a new one taken later would stretch the
+    #    window beyond the load.
     sink_deltas: dict[str, Any] | None = None
     stopped_at = utc_now()
-    after_path = test_dir / "after.json"
-    if session.get("sql") and session.get("snapshot"):
+    if has_sql:
         if after_path.exists():
             after_snapshot = read_json(after_path)
             LOG.info("Reusing the 'after' snapshot taken at %s.", after_snapshot["captured_at_utc"])
@@ -1217,10 +1554,29 @@ def command_stop(args: argparse.Namespace) -> int:
     else:
         LOG.info("No SQL 'before' snapshot exists for this test; SQL measurements are not collected.")
 
-    payload = _load_copy_payload(args, started_at)
+    # How long after the pipeline finished the 'after' snapshot was taken.
+    # Without SQL there is no snapshot, so there is no lag to report.
+    if waited:
+        run_end = parse_adf_time(waited.get("run_end"))
+        waited["snapshot_lag_seconds"] = (
+            round(max(0.0, (stopped_at - run_end).total_seconds()), 1) if has_sql and run_end else None
+        )
+
+    if args.snapshot_only:
+        LOG.info("Stopped after the 'after' snapshot (--snapshot-only).")
+        print(f"Test {args.test_id}: the 'after' snapshot is saved.")
+        print("Save the Copy activity output from ADF Studio, then finish the record with:")
+        print(f"  python scripts/collect_run_metrics.py stop --test-id {args.test_id} "
+              "--adf-output-file <saved-file> --result <PASS|FAIL|INVESTIGATE> --next-action-reason \"...\"")
+        return 0
+
+    # 3. Read the Copy activity result.
+    run_id = args.pipeline_run_id or (waited or {}).get("run_id")
+    payload = _load_copy_payload(args, started_at, run_id)
     write_json(test_dir / "adf_activity.json", payload)
     copy = summarise_copy_activity(payload)
 
+    # 4. Build and write the record.
     notes = {
         "change_under_test": args.change,
         "target_table_design": args.target_table_design,
@@ -1240,8 +1596,13 @@ def command_stop(args: argparse.Namespace) -> int:
         "recorded_by": session.get("recorded_by"),
         "host": session.get("host"),
         "sql_server": (session.get("sql") or {}).get("server"),
+        "pipeline_name": (waited or {}).get("pipeline_name"),
+        "pipeline_run_id": run_id,
+        "pipeline_status": (waited or {}).get("status"),
+        "pipeline_run_end": (waited or {}).get("run_end"),
+        "snapshot_lag_seconds": (waited or {}).get("snapshot_lag_seconds"),
     }
-    record = build_benchmark_record(test, notes, copy, sink_deltas)
+    record = build_benchmark_record(test, notes, copy, sink_deltas, waited)
 
     write_json(record_path, record)
     markdown_path = test_dir / "benchmark_record.md"
@@ -1288,7 +1649,8 @@ def command_list(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Record one ADF load test as a benchmark record (runbook section 11).",
-        epilog="Run 'start' immediately before the ADF pipeline and 'stop' immediately after it finishes.",
+        epilog=("Run 'start' immediately before the ADF pipeline. Then either run 'stop' as soon as the "
+                "pipeline finishes, or run 'stop --wait' straight away and let it watch the run."),
     )
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1324,6 +1686,17 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--factory", help="Data factory name")
     source.add_argument("--pipeline-run-id", help="Run ID of the pipeline run that performed the load")
     source.add_argument("--activity-name", help="Copy activity name; needed only when the pipeline has more than one")
+    waiting = stop.add_argument_group("waiting for the pipeline to finish (checks status in ADF only)")
+    waiting.add_argument("--wait", action="store_true",
+                         help="Watch the pipeline run in ADF and take the 'after' snapshot the moment it finishes")
+    waiting.add_argument("--pipeline-name", help="Pipeline to watch; the run of it that started after 'start' is followed")
+    waiting.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS,
+                         help=f"Seconds between status checks (default {DEFAULT_POLL_SECONDS}, "
+                              f"minimum {MINIMUM_POLL_SECONDS})")
+    waiting.add_argument("--timeout-hours", type=float, default=DEFAULT_TIMEOUT_HOURS,
+                         help=f"Stop waiting after this many hours (default {DEFAULT_TIMEOUT_HOURS:g})")
+    waiting.add_argument("--snapshot-only", action="store_true",
+                         help="Stop after the 'after' snapshot; finish later with --adf-output-file")
     notes = stop.add_argument_group("what the tester knows")
     notes.add_argument("--change", help="What was changed for this test, for example 'DIU 4 -> 8'")
     notes.add_argument("--target-table-design", help="For example 'heap, no indexes' or 'clustered index + 2 nonclustered'")
@@ -1349,6 +1722,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOG.setLevel(getattr(logging, args.log_level))
     try:
         return args.handler(args)
+    except KeyboardInterrupt:
+        # Ctrl+C, usually while waiting. Nothing is lost: the 'before'
+        # snapshot stays on disk, so 'stop' can simply be run again.
+        LOG.warning("%s was stopped with Ctrl+C. Saved snapshots are kept; run it again to continue.", args.command)
+        return 130
     except Exception as exc:  # one clear message, no stack trace, non-zero exit code
         LOG.error("%s failed: %s", args.command, exc)
         return 2

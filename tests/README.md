@@ -59,3 +59,4 @@ python -m unittest tests/test_collect_run_metrics.py -v
 | Azure paging | Continues reading while a continuation token is returned, including after an empty page. |
 | Benchmark record | Holds every runbook section 11 field; warns about failed copies, row mismatches, skipped rows, and a measurement window much longer than the copy. |
 | Commands | `start`, `stop`, and `list` run end to end; existing results are never replaced without `--force`; a failed `stop` reuses its "after" snapshot when run again; the verdict is required before anything is measured; no secret is written to disk. |
+| Waiting (`stop --wait`) | Finds the run by pipeline name or ID and follows it through Queued and InProgress to a final status; times out; retries passing faults and stops on lasting ones; reads nothing from the sink while waiting; `--snapshot-only` then a saved file completes the record; Ctrl+C keeps the "before" snapshot. |
