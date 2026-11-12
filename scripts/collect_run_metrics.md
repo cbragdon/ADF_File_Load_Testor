@@ -139,6 +139,11 @@ python -m unittest discover -s tests -v
 All tests should pass. They need no database or Azure access, so a failure
 here points to the Python setup, not to your environment.
 
+These are checks of the collector, not the collector itself. Passing them
+doesn't record anything. The collector is `scripts\collect_run_metrics.py`,
+which you run in [Record a test](#record-a-test). You never run
+`scripts\mi_capacity.py` directly; the collector uses it.
+
 ### 6. Record one trial test and check it by hand
 
 For the first real test, record the run with the steps in
