@@ -304,6 +304,10 @@ Only a PASS becomes the new production baseline.
 
 ## 11. Benchmark record
 
+`scripts/collect_run_metrics.py` produces this record automatically. Run its
+`start` command immediately before the load and its `stop` command immediately
+after. See the [Run Collector guide](../scripts/collect_run_metrics.md).
+
 For a meaningful test, retain:
 
 ```text

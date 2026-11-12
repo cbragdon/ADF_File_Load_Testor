@@ -12,6 +12,13 @@ These scripts are intended for the ADF Performance Toolkit learning lab and for 
 
 ## Recommended test workflow
 
+`scripts\collect_run_metrics.py` automates the before-and-after captures of
+scripts 02, 06, and 07 (steps 2, 5, 8, and 9 below, and the script 02 part of
+step 10) and writes the result as a benchmark record. See the
+[Run Collector guide](../../scripts/collect_run_metrics.md). The scripts remain
+the way to inspect the sink by hand, and scripts 01, 03, 04, 05, and 08 are
+still run manually.
+
 For each ADF benchmark:
 
 1. Run `01_check_recovery_and_log_reuse.sql` to establish recovery and log-reuse state.

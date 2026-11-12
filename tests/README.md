@@ -35,3 +35,27 @@ python -m unittest discover -s tests -v
 Each test recombines the generated data records and compares them with the
 original source rows. This confirms that every source record is written exactly
 once.
+
+# Run Collector Tests
+
+`test_collect_run_metrics.py` verifies `scripts\collect_run_metrics.py`. The
+tests need no database, no Azure access, and no third-party packages. SQL is
+replaced by a fake connection that returns prepared rows, and the Azure REST
+call is replaced by a fake that returns prepared pages.
+
+## Run the tests
+
+```powershell
+python -m unittest tests/test_collect_run_metrics.py -v
+```
+
+## What the tests verify
+
+| Area | Verification |
+| --- | --- |
+| SQL snapshot | Uses the instance wait view on SQL Server and SQL MI and the database wait view on Azure SQL Database; every query is a `SELECT`. |
+| SQL deltas | Wait, file I/O, latency, and log-usage figures describe only the window between the two snapshots; a counter reset is reported instead of producing a negative number; log growth during a test is flagged. |
+| Copy activity result | Reads both accepted JSON shapes; configured settings are recorded as unknown when only the output is supplied; unrelated JSON is rejected. |
+| Azure paging | Continues reading while a continuation token is returned, including after an empty page. |
+| Benchmark record | Holds every runbook section 11 field; warns about failed copies, row mismatches, skipped rows, and a measurement window much longer than the copy. |
+| Commands | `start`, `stop`, and `list` run end to end; existing results are never replaced without `--force`; a failed `stop` reuses its "after" snapshot when run again; the verdict is required before anything is measured; no secret is written to disk. |
