@@ -12,23 +12,25 @@ compared with each other and used later to refine copy settings.
 
 ## What it does
 
-A test is recorded with two commands, one on each side of the ADF run.
+A test takes two snapshots of the SQL sink: one before the load and one after
+it. Each is taken once, by its own command.
 
-| Step | Command | When | What it does |
-| --- | --- | --- | --- |
-| 1 | `start` | Immediately before the ADF pipeline starts | Takes a "before" snapshot of the SQL sink and opens the test |
-| 2 | (run the ADF pipeline) | | |
-| 3 | `stop` | After the ADF pipeline finishes | Takes the "after" snapshot, calculates what changed, reads the Copy activity result, and writes the record |
+| Order | What you do | What it captures |
+| --- | --- | --- |
+| 1 | Run `start` | The "before" snapshot |
+| 2 | Start the ADF pipeline | Nothing; this is the load being measured |
+| 3 | Run `stop` | The "after" snapshot, then the Copy activity result, then the record |
 
-You don't have to watch the pipeline and run `stop` at the right moment. Run
-`stop --wait` straight after starting the pipeline instead. It checks the
-run's status in ADF every 30 seconds and takes the "after" snapshot as soon as
-the run finishes, whether that takes five minutes or five hours. See
-[Let the collector wait](#3-let-the-collector-wait-for-the-pipeline).
-
-Two commands are needed because the SQL counters are cumulative. One reading
+Two snapshots are needed because the SQL counters are cumulative. One reading
 says nothing about one load. Only the difference between a reading taken before
 the load and a reading taken after it describes the load.
+
+**You don't have to time `stop` yourself.** Add `--wait` and you can run `stop`
+as soon as the pipeline is started. It sits and checks the run's status in ADF
+every 30 seconds, and takes the "after" snapshot the moment the run finishes,
+whether that takes five minutes or five hours. This is the normal way to
+finish a test. Other ways are described under
+[Other ways to finish a test](#other-ways-to-finish-a-test).
 
 The script is read-only against SQL. It selects from system views and changes
 nothing.
@@ -52,7 +54,7 @@ python -m pip install pyodbc azure-identity
 | --- | --- | --- |
 | SQL Server and SQL Managed Instance | Permission to view server state | Wait statistics and file I/O counters are server-level views |
 | Azure SQL Database | Permission to view database state | The database-scoped wait and I/O views are used |
-| Data factory (option A and `--wait` only) | Read access to the factory's pipeline runs | To check the run's status and read the Copy activity run |
+| Data factory | Read access to the factory's pipeline runs | To check the run's status and read the Copy activity result. Not needed only when you [stop by hand](#stop-by-hand-without-waiting) with a saved file |
 
 These are the same permissions the scripts in `sql\monitoring\` need. The
 collector accepts no password, key, or token. SQL and Azure access use your
@@ -132,17 +134,19 @@ here points to the Python setup, not to your environment.
 
 ### 6. Record one trial test and check it by hand
 
-For the first real test, record the run with the collector and, around the
-same load, run scripts 02, 06, and 07 from `sql\monitoring\` by hand. Then
-compare the two, as described under [Verification status](#verification-status).
-Use the saved-file option for the ADF result on this first run: it needs no
-Azure sign-in, so any difference you find comes from the SQL side.
+For the first real test, record the run with the steps in
+[Record a test](#record-a-test) and, around the same load, run scripts 02, 06,
+and 07 from `sql\monitoring\` by hand. Then compare the two, as described
+under [Verification status](#verification-status).
 
 ## Record a test
 
-Run the commands from the repository root.
+Run the commands from the repository root. Each test runs `start` once and
+`stop` once.
 
-### 1. Start, immediately before the load
+### 1. Run `start` to take the "before" snapshot
+
+Do this immediately before you start the pipeline.
 
 ```powershell
 python .\scripts\collect_run_metrics.py start `
@@ -152,8 +156,8 @@ python .\scripts\collect_run_metrics.py start `
     --auth entra-default
 ```
 
-The script prints where the "before" snapshot was saved. Start the ADF pipeline
-as soon as it returns.
+The script prints where the "before" snapshot was saved. Go straight on to
+step 2.
 
 `--auth` accepts `windows` (default), `entra-default`, or `entra-interactive`,
 exactly as the file generator does.
@@ -164,10 +168,11 @@ Start it however you normally do: from ADF Studio, a trigger, or a script.
 The collector does not start it. Keep other work off the sink while it runs
 (see [Limits](#limits)).
 
-### 3. Let the collector wait for the pipeline
+### 3. Run `stop --wait`, and leave it
 
-This is the easiest way to finish a test. Run it straight after starting the
-pipeline, then leave it.
+Run this as soon as the pipeline is started. It does not take the "after"
+snapshot straight away. It waits until the pipeline finishes, then takes the
+snapshot, reads the Copy activity result from Azure, and writes the record.
 
 ```powershell
 python .\scripts\collect_run_metrics.py stop `
@@ -178,14 +183,19 @@ python .\scripts\collect_run_metrics.py stop `
     --resource-group rg-data-dev `
     --factory adf-data-dev `
     --change "DIU 4 -> 8" `
+    --target-table-design "heap, no indexes" `
+    --correctness "row counts match" `
     --result PASS `
     --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
 ```
 
 While it waits, it prints each status change (Queued, InProgress, then
-Succeeded) and a short "still waiting" line every ten minutes. When the run
-finishes, it takes the "after" snapshot straight away, reads the result from
-Azure (option A below), and writes the record.
+Succeeded) and a short "still waiting" line every ten minutes.
+
+`--result` and `--next-action-reason` are required. If you leave them out, the
+script asks for them once the pipeline has finished. The runbook treats the
+reason for the next action as the point of the record: it stops tuning from
+becoming a sequence of unexplained setting changes.
 
 Things to know:
 
@@ -207,38 +217,34 @@ Things to know:
 - **Keep the computer awake.** If it sleeps, the checks pause and the "after"
   snapshot is taken late. The record warns you when that happens.
 
-**To finish with a saved file (option B) instead,** add `--snapshot-only`. The
-collector waits, takes the "after" snapshot when the run finishes, and stops
-there. Save the Copy activity output from ADF Studio whenever it suits you, then
-finish the record with the option B command below. It reuses the snapshot that
-was taken at completion. The verdict isn't needed until that second command.
-
-### 4. Or stop by hand, after the load
-
-If you'd rather not wait with the collector, run `stop` yourself as soon as
-the pipeline finishes. Choose one of two ways to give it the Copy activity
-result.
-
-**Option A: read the run from Azure.** Copy the pipeline run ID from the ADF
-Studio Monitor tab.
+### 4. Review
 
 ```powershell
-python .\scripts\collect_run_metrics.py stop `
-    --test-id DIU-08-run1 `
-    --subscription-id 00000000-0000-0000-0000-000000000000 `
-    --resource-group rg-data-dev `
-    --factory adf-data-dev `
-    --pipeline-run-id 11111111-2222-3333-4444-555555555555 `
-    --change "DIU 4 -> 8" `
-    --target-table-design "heap, no indexes" `
-    --correctness "row counts match" `
-    --result PASS `
-    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
+python .\scripts\collect_run_metrics.py list
 ```
 
-**Option B: use a file saved from ADF Studio.** In the Monitor tab, open the
-pipeline run, select the Copy activity's **Output** link, and save the JSON to
-a file.
+This prints one line per recorded test and rebuilds the index file.
+
+## Other ways to finish a test
+
+The steps above cover most tests. Use one of these only when they don't suit
+you. Each one still takes the "after" snapshot once.
+
+### Finish from a file saved in ADF Studio
+
+Use this when you want the record built from a file you saved, rather than
+from Azure. `stop` then runs in two parts, and the snapshot is still taken only
+once.
+
+1. **Wait and take the snapshot.** Run step 3's command with
+   `--snapshot-only` added. You can leave out `--result`,
+   `--next-action-reason`, and the other notes for now. It waits for the
+   pipeline, takes the "after" snapshot when it finishes, and stops.
+2. **Save the Copy activity result.** In ADF Studio, open the pipeline run on
+   the Monitor tab, select the Copy activity's **Output** link, and save the
+   JSON to a file.
+3. **Finish the record.** This does not take another snapshot. It uses the one
+   taken in part 1 and adds the ADF result.
 
 ```powershell
 python .\scripts\collect_run_metrics.py stop `
@@ -249,28 +255,43 @@ python .\scripts\collect_run_metrics.py stop `
     --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
 ```
 
-Option A records the *configured* DIUs, parallel copies, and write batch size
-as well as the actual ones, because it reads the activity's input. The Output
-link alone does not contain the configured values, so with Option B they are
-recorded as "not recorded" and the record carries a warning. To get them with
-Option B, save a file containing both sections:
+The **Output** link does not contain the *configured* DIUs, parallel copies,
+and write batch size, so those are recorded as "not recorded" and the record
+carries a warning. To keep them, save one file containing both the activity's
+**Input** and **Output**:
 
 ```json
 { "input": { ...the activity's Input JSON... }, "output": { ...the activity's Output JSON... } }
 ```
 
-`--result` and `--next-action-reason` are required. If you leave them out, the
-script asks for them. The runbook treats the reason for the next action as the
-point of the record: it stops tuning from becoming a sequence of unexplained
-setting changes.
+### Stop by hand, without waiting
 
-### 5. Review
+Use this only when the collector can't check the run's status, for example
+because it can't reach the ADF management API from where you run it.
+
+Watch the pipeline in ADF Studio, and run `stop` without `--wait` as soon as
+it finishes. It takes the "after" snapshot immediately, so run it promptly:
+any delay is added to the measurement window.
+
+Give it the Copy activity result in either of two ways.
+
+**From Azure,** using the run ID from the ADF Studio Monitor tab:
 
 ```powershell
-python .\scripts\collect_run_metrics.py list
+python .\scripts\collect_run_metrics.py stop `
+    --test-id DIU-08-run1 `
+    --subscription-id 00000000-0000-0000-0000-000000000000 `
+    --resource-group rg-data-dev `
+    --factory adf-data-dev `
+    --pipeline-run-id 11111111-2222-3333-4444-555555555555 `
+    --change "DIU 4 -> 8" `
+    --result PASS `
+    --next-action-reason "Throughput rose 30% with no log governor waits; test 16 DIU next."
 ```
 
-This prints one line per recorded test and rebuilds the index file.
+**From a saved file,** using the same command as in
+[Finish from a file saved in ADF Studio](#finish-from-a-file-saved-in-adf-studio),
+part 3. If the collector can't reach Azure at all, this is the way to use.
 
 ## What is written
 
@@ -536,7 +557,7 @@ before comparing runs.
 | Counters were reset between the snapshots | The instance restarted or failed over during the test | Repeat the test |
 | The transaction log grew during the test | Log growth happened inside the run | Do not compare this run with runs that started with space already allocated |
 | Rows read do not equal rows copied | Rows were skipped or the copy failed | Treat the run as a correctness failure until explained |
-| Configured values are unknown | Only the activity output was supplied | Use Option A, or save input and output together |
+| Configured values are unknown | Only the activity output was supplied | Let `stop --wait` read the result from Azure, or save input and output together |
 
 ## Safe to repeat
 
@@ -571,7 +592,7 @@ is running, as the monitoring guide describes.
   the Copy activity. The record shows both durations and warns when they
   differ by much.
 - **Waiting needs Azure access.** `--wait` checks the run's status through the
-  ADF management API, so it needs the same access as option A.
+  ADF management API, so it needs read access to the factory's pipeline runs.
 - **Waiting needs the computer awake.** The checks run on your computer. If it
   sleeps or shuts down, the wait pauses or stops.
 - **Copy activity loads only.** Loads that do not use a Copy activity are not
