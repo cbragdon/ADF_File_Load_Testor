@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delimited file split summary</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; }
+    body { margin: 0; padding: 24px 16px; }
+    main { max-width: 1200px; margin: auto; }
+    h1 { font-size: 1.5rem; margin: 0 0 8px; }
+    p { line-height: 1.5; }
+    a { color: #58a6ff; }
+    .carousel {
+      display: flex;
+      overflow-x: auto;
+      scroll-snap-type: x mandatory;
+      scrollbar-width: none;
+      cursor: grab;
+    }
+    .carousel::-webkit-scrollbar { display: none; }
+    .carousel.dragging { cursor: grabbing; scroll-snap-type: none; }
+    .slide { flex: 0 0 100%; min-width: 0; scroll-snap-align: start; }
+    .slide img { display: block; width: 100%; height: auto; user-select: none; }
+    .controls { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; margin: 16px 0; }
+    .controls[hidden] { display: none; }
+    button {
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid #8b949e;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
+    .position { display: grid; gap: 6px; text-align: center; }
+    input[type="range"] { width: 100%; margin: 0; accent-color: #58a6ff; cursor: pointer; }
+    :focus-visible { outline: 3px solid #58a6ff; outline-offset: 3px; }
+    .note { color: #8b949e; }
+    @media (max-width: 500px) {
+      body { padding: 16px 8px; }
+      .controls { gap: 8px; }
+      button { padding: 10px 8px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Delimited file split summary</h1>
+    <p>Drag the picture or slider left and right, swipe on a touch screen, or use the buttons. No autoplay.</p>
+    <div class="carousel" id="carousel" role="region" aria-roledescription="carousel" aria-label="File split summary" tabindex="0">
+      <div class="slide" role="group" aria-roledescription="slide" aria-label="1 of 3: source file">
+        <img src="source.png" width="1200" height="620" draggable="false" alt="One 2 GB source file containing 24,000,000 rows.">
+      </div>
+      <div class="slide" role="group" aria-roledescription="slide" aria-label="2 of 3: planning">
+        <img src="planning.png" width="1200" height="620" draggable="false" alt="Plan an even four-way split: 6,000,000 rows per file, with an illustrative size of 500 MB each.">
+      </div>
+      <div class="slide" role="group" aria-roledescription="slide" aria-label="3 of 3: validation">
+        <img src="validation.png" width="1200" height="620" draggable="false" alt="Split complete: four balanced files, 6,000,000 rows each; all 24,000,000 source rows written and validated.">
+      </div>
+    </div>
+    <div class="controls" id="controls" hidden>
+      <button id="previous" type="button" aria-controls="carousel" disabled>&lt; Previous</button>
+      <div class="position">
+        <label for="position">Slide <span id="counter" aria-live="polite">1 of 3</span></label>
+        <input id="position" type="range" min="0" max="2" step="1" value="0" aria-controls="carousel" aria-valuetext="Slide 1 of 3">
+      </div>
+      <button id="next" type="button" aria-controls="carousel">Next &gt;</button>
+    </div>
+    <noscript><p>JavaScript is off. Swipe or scroll the pictures horizontally to browse the slides.</p></noscript>
+    <p class="note">File sizes and row counts are illustrative; actual results depend on the input.</p>
+    <p><a href="https://github.com/cbragdon/ADF_Performance_Toolkit/blob/main/scripts/README.md#split-summary">Back to the splitter guide</a></p>
+  </main>
+  <script>
+    const carousel = document.getElementById("carousel");
+    const previous = document.getElementById("previous");
+    const next = document.getElementById("next");
+    const position = document.getElementById("position");
+    const counter = document.getElementById("counter");
+    const last = carousel.children.length - 1;
+    let active = 0;
+    let drag = null;
+
+    function updateControls() {
+      active = Math.max(0, Math.min(last, Math.round(carousel.scrollLeft / carousel.clientWidth)));
+      previous.disabled = active === 0;
+      next.disabled = active === last;
+      position.value = active;
+      const description = `${active + 1} of ${last + 1}`;
+      if (counter.textContent !== description) counter.textContent = description;
+      position.setAttribute("aria-valuetext", `Slide ${description}`);
+    }
+
+    function goTo(index, behavior = "smooth") {
+      const target = Math.max(0, Math.min(last, index));
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      carousel.scrollTo({
+        left: target * carousel.clientWidth,
+        behavior: reducedMotion ? "instant" : behavior
+      });
+    }
+
+    previous.addEventListener("click", () => goTo(active - 1));
+    next.addEventListener("click", () => goTo(active + 1));
+    position.addEventListener("input", () => goTo(Number(position.value), "instant"));
+    carousel.addEventListener("scroll", updateControls, { passive: true });
+    carousel.addEventListener("keydown", (event) => {
+      const targets = { ArrowLeft: active - 1, ArrowRight: active + 1, Home: 0, End: last };
+      if (Object.hasOwn(targets, event.key)) {
+        event.preventDefault();
+        goTo(targets[event.key]);
+      }
+    });
+
+    carousel.addEventListener("pointerdown", (event) => {
+      if (event.pointerType !== "mouse" || event.button !== 0) return;
+      drag = { id: event.pointerId, x: event.clientX, left: carousel.scrollLeft };
+      carousel.classList.add("dragging");
+      carousel.focus({ preventScroll: true });
+      carousel.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    carousel.addEventListener("pointermove", (event) => {
+      if (!drag || drag.id !== event.pointerId) return;
+      carousel.scrollLeft = drag.left - (event.clientX - drag.x);
+    });
+    function finishDrag(event) {
+      if (!drag || drag.id !== event.pointerId) return;
+      const target = Math.round(carousel.scrollLeft / carousel.clientWidth);
+      drag = null;
+      carousel.classList.remove("dragging");
+      if (carousel.hasPointerCapture(event.pointerId)) carousel.releasePointerCapture(event.pointerId);
+      goTo(target);
+    }
+    carousel.addEventListener("pointerup", finishDrag);
+    carousel.addEventListener("pointercancel", finishDrag);
+    carousel.addEventListener("lostpointercapture", finishDrag);
+    window.addEventListener("resize", () => goTo(active, "instant"));
+    document.getElementById("controls").hidden = false;
+    updateControls();
+  </script>
+</body>
+</html>
