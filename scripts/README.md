@@ -70,12 +70,19 @@ These slides illustrate a 2 GB delimited source file containing 24,000,000
 rows. They show the splitter planning and validating an even four-way split:
 four 500 MB files containing 6,000,000 rows each.
 
-Select the preview to open the interactive slider on GitHub Pages. Drag the
-picture or slider left and right, swipe on a touch screen, or use
-**Previous** and **Next**. Nothing advances automatically. GitHub READMEs
-cannot embed these interactive controls, so the slider opens on its own page.
+Use the horizontal scrollbar beneath the images to move left or right
+through the three steps without leaving this README. Nothing advances
+automatically.
 
-[![Source file: 2 GB containing 24,000,000 rows](../docs/split-summary/source.png)](https://cbragdon.github.io/ADF_Performance_Toolkit/split-summary/)
+<table>
+<tr>
+<td nowrap>
+<img src="../docs/split-summary/source.png" width="1200" alt="Source: one 2 GB file containing 24,000,000 rows">
+<img src="../docs/split-summary/planning.png" width="1200" alt="Planning: four 500 MB files containing 6,000,000 rows each">
+<img src="../docs/split-summary/validation.png" width="1200" alt="Validation: four balanced output files totaling 24,000,000 rows">
+</td>
+</tr>
+</table>
 
 ```powershell
 python .\scripts\split_delimited_file.py .\data\load_test_input.psv --parts 4 --output-dir .\data\split_output --delimiter "|"
