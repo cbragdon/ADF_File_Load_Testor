@@ -64,19 +64,22 @@ python .\scripts\split_delimited_file.py .\data\sales.psv --parts 8 --output-dir
 
 ## Examples
 
-### Animated split summary
+### Split summary
 
-This animation illustrates a 2 GB delimited source file containing 24,000,000
-rows. It shows the splitter planning and validating an even four-way split:
+These slides illustrate a 2 GB delimited source file containing 24,000,000
+rows. They show the splitter planning and validating an even four-way split:
 four 500 MB files containing 6,000,000 rows each.
 
-![Animation of a 2 GB file splitting into four files](../docs/images/split-summary.gif)
+Select the preview to open the slides, then use **Previous** and **Next** to
+move in either direction at your own pace. Nothing advances automatically.
+
+[![Source file: 2 GB containing 24,000,000 rows](../docs/split-summary/source.png)](../docs/split-summary/README.md)
 
 ```powershell
 python .\scripts\split_delimited_file.py .\data\load_test_input.psv --parts 4 --output-dir .\data\split_output --delimiter "|"
 ```
 
-The actual file size and row count depend on the input. The animation uses the
+The actual file size and row count depend on the input. The slides use the
 24,000,000-row example above to show how the reported planned and validated
 counts relate to four output files.
 
